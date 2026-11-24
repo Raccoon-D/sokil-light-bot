@@ -23,6 +23,16 @@ USER_AGENT = (
     "Chrome/131.0.0.0 Safari/537.36"
 )
 
+CLOUDFLARE_MARKERS = (
+    "Триває перевірка безпеки",
+    "Cloudflare",
+    "Ray ID:",
+    "Verify you are human",
+    "Checking your browser",
+    "Just a moment",
+    "challenges.cloudflare.com",
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -141,14 +151,14 @@ async def fetch_site_text():
                 if response.request.resource_type in {"xhr", "fetch"}:
                     body = await response.text()
                     if body and ("4.1" in body or "4,1" in body or "ГПВ" in body or "2026" in body):
-                        xhr_chunks.append(body[:1000])
+                        xhr_chunks.append(body[:2000])
             except Exception:
                 pass
 
         page.on("response", handle_response)
 
         await page.goto(SOURCE_URL, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(12000)
+        await page.wait_for_timeout(6000)
 
         for frame in page.frames:
             try:
@@ -240,18 +250,14 @@ async def check_once():
     if not text.strip():
         raise RuntimeError("Сайт не повернув текст графіка.")
 
+    if any(marker in text for marker in CLOUDFLARE_MARKERS):
+        raise RuntimeError("Cloudflare Challenge: графік недоступний для бота.")
+
     events = extract_events(text)
     if not events:
-        cleaned_lines = [
-            re.sub(r"\s+", " ", line).strip()
-            for line in text.splitlines()
-            if line.strip()
-        ]
-        preview = "\n".join(cleaned_lines[:20])[:1500]
-        telegram_send(
-            f"ℹ️ Інтервалів для черги {QUEUE} не знайдено.\n"
-            "Ось перші рядки, які бачить скрипт:\n\n"
-            f"{preview or 'Порожній текст'}"
+        logging.info(
+            "Майбутніх або активних інтервалів для черги %s не знайдено.",
+            QUEUE,
         )
         return
 
