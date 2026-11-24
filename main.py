@@ -33,6 +33,7 @@ TIME_RE = re.compile(
 )
 DATE_DMY_RE = re.compile(r"(?<!\d)(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?!\d)")
 DATE_YMD_RE = re.compile(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)")
+QUEUE_RE = re.compile(r"(?<![\d.])4[.,]1(?!\d)")
 
 
 def load_state():
@@ -72,30 +73,42 @@ def parse_date(text):
 
 def extract_events(page_text):
     """
-    Шукає згадки черги 4.1 і витягує часові інтервали та дати.
+    Аналізує сторінку по рядках, щоб коректно прив'язати дату і час до черги 4.1.
     """
-    text = re.sub(r"[ \t]+", " ", page_text)
+    lines = [re.sub(r"\s+", " ", line).strip() for line in page_text.splitlines()]
+    lines = [line for line in lines if line]
+
     now = datetime.now(TZ)
     now_date = now.date()
+    current_date = now_date
     events = []
 
-    positions = [m.start() for m in re.finditer(r"(?<![\d.])4[.,]1(?!\d)", text)]
-    for pos in positions:
-        chunk = text[max(0, pos - 500) : min(len(text), pos + 1800)]
-        ranges = list(TIME_RE.finditer(chunk))
-        if not ranges:
+    for idx, line in enumerate(lines):
+        found_date = parse_date(line)
+        if found_date and not TIME_RE.search(line):
+            current_date = found_date
+
+        if not QUEUE_RE.search(line):
             continue
 
-        event_date = parse_date(chunk) or now_date
+        # Беремо поточний рядок і сусідні рядки цього ж запису таблиці
+        neighbor_lines = lines[max(0, idx - 2) : min(len(lines), idx + 4)]
+        block = " | ".join(neighbor_lines)
+
+        row_date = parse_date(block) or current_date
+        ranges = list(TIME_RE.finditer(block))
 
         for m in ranges:
             sh, sm, eh, em = map(int, m.groups())
-            start = datetime.combine(event_date, time(sh, sm), TZ)
-            end = datetime.combine(event_date, time(eh, em), TZ)
+            # Відсікаємо заголовки шкали на кшталт 00:00-12:00 або 12:00-24:00, якщо вони не схожі на інтервал відключення
+            if (sh, sm, eh, em) in {(0, 0, 12, 0), (12, 0, 24, 0)}:
+                continue
+
+            start = datetime.combine(row_date, time(sh, sm), TZ)
+            end = datetime.combine(row_date, time(eh, em), TZ)
             if end <= start:
                 end += timedelta(days=1)
 
-            # Беремо лише майбутні або поточні події, які ще не завершилися
             if end > now:
                 events.append((start, end))
 
@@ -110,14 +123,29 @@ async def fetch_site_text():
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page(locale="uk-UA", timezone_id="Europe/Kyiv")
-        await page.goto(SOURCE_URL, wait_until="domcontentloaded", timeout=60000)
+        await page.goto(SOURCE_URL, wait_until="networkidle", timeout=60000)
         await page.wait_for_timeout(5000)
 
         for frame in page.frames:
             try:
-                body = await frame.locator("body").inner_text(timeout=8000)
-                if body.strip():
-                    texts.append(body)
+                # Збираємо рядки таблиць через табуляцію, щоб колонки не злипалися
+                rows_text = await frame.evaluate(
+                    """() => {
+                        const rows = Array.from(document.querySelectorAll('tr'));
+                        if (rows.length > 0) {
+                            return rows
+                                .map(r => Array.from(r.querySelectorAll('th, td'))
+                                    .map(c => c.innerText.trim())
+                                    .filter(Boolean)
+                                    .join(' | '))
+                                .filter(Boolean)
+                                .join('\\n');
+                        }
+                        return document.body ? document.body.innerText : '';
+                    }"""
+                )
+                if rows_text and rows_text.strip():
+                    texts.append(rows_text)
             except Exception:
                 continue
         await browser.close()
@@ -222,3 +250,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
