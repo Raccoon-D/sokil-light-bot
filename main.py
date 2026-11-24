@@ -23,16 +23,6 @@ USER_AGENT = (
     "Chrome/131.0.0.0 Safari/537.36"
 )
 
-CLOUDFLARE_MARKERS = (
-    "Триває перевірка безпеки",
-    "Cloudflare",
-    "Ray ID:",
-    "Verify you are human",
-    "Checking your browser",
-    "Just a moment",
-    "challenges.cloudflare.com",
-)
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -157,8 +147,36 @@ async def fetch_site_text():
 
         page.on("response", handle_response)
 
-        await page.goto(SOURCE_URL, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(6000)
+        await page.goto(
+            SOURCE_URL,
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+
+        await page.wait_for_timeout(5000)
+
+        title = await page.title()
+        body = await page.locator("body").inner_text()
+
+        if (
+            "Just a moment" in title
+            or "Checking your browser" in body
+            or "Verify you are human" in body
+            or "challenges.cloudflare.com" in body
+        ):
+            await page.screenshot(
+                path="cloudflare_challenge.png",
+                full_page=True,
+            )
+            await browser.close()
+            raise RuntimeError(
+                "Cloudflare Challenge заблокував автоматичне "
+                "завантаження сайту. Скриншот збережено."
+            )
+
+        logging.info("Сторінка завантажена: %s", title)
+
+        await page.wait_for_timeout(7000)
 
         for frame in page.frames:
             try:
@@ -247,11 +265,19 @@ def event_key(start, end):
 async def check_once():
     logging.info("Перевіряю офіційний графік для черги %s", QUEUE)
     text = await fetch_site_text()
+
     if not text.strip():
         raise RuntimeError("Сайт не повернув текст графіка.")
 
-    if any(marker in text for marker in CLOUDFLARE_MARKERS):
-        raise RuntimeError("Cloudflare Challenge: графік недоступний для бота.")
+    if (
+        "Триває перевірка безпеки" in text
+        or "Cloudflare" in text
+        or "Ray ID:" in text
+        or "Verify you are human" in text
+    ):
+        raise RuntimeError(
+            "Cloudflare Challenge: графік недоступний для бота."
+        )
 
     events = extract_events(text)
     if not events:
@@ -297,30 +323,5 @@ async def check_once():
         save_state(state)
 
 
-async def main():
-    if not BOT_TOKEN or not CHAT_ID:
-        raise SystemExit(
-            "Заповни TELEGRAM_BOT_TOKEN і TELEGRAM_CHAT_ID у змінних середовища або .env."
-        )
-
-    if RUN_ONCE:
-        await check_once()
-        return
-
-    telegram_send(
-        "✅ Бот моніторингу графіка запущений.\n"
-        f"Черга: {QUEUE}\n"
-        f"Перевірка: кожні {CHECK_EVERY_SECONDS // 60} хв.\n"
-        "Сповіщення: одразу після виявлення нового майбутнього відключення."
-    )
-    while True:
-        try:
-            await check_once()
-        except Exception:
-            logging.exception("Помилка перевірки")
-        await asyncio.sleep(CHECK_EVERY_SECONDS)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-    
+async def main
+            
