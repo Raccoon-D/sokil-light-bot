@@ -1,3 +1,20 @@
+name: Energy Bot
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -18,4 +35,17 @@
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           RUN_ONCE: "1"
+
+      - name: Save state if updated
+        if: always()
+        run: |
+          if [ -f state.json ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add state.json
+            if ! git diff --staged --quiet; then
+              git commit -m "Update notified outage state [skip ci]"
+              git push
+            fi
+          fi
           
