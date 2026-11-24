@@ -162,11 +162,18 @@ async def fetch_site_text():
             challenge_type="interstitial",
         )
         if not solved:
+            await page.wait_for_timeout(5000)
+            solved = await solve_captcha(
+                page,
+                captcha_type="cloudflare",
+                challenge_type="interstitial",
+            )
+        if not solved:
             logging.warning(
                 "Cloudflare challenge не пройдено автоматично, пробуємо далі..."
             )
 
-        await page.wait_for_timeout(8000)
+        await page.wait_for_timeout(15000)
 
         for frame in page.frames:
             try:
@@ -294,54 +301,5 @@ async def check_once():
                 "⚡️ Виявлено майбутнє відключення світла\n\n"
                 f"Черга: {QUEUE}\n"
                 f"Дата: {start:%Y-%m-%d}\n"
-                f"Інтервал: {start:%H:%M}–{end:%H:%M}\n\n"
-                "Джерело: Волиньобленерго\n"
-                "Фактичний час може відрізнятися від графіка."
-            )
-            telegram_send(msg)
-            notified.add(key)
-            changed = True
-            logging.info("Надіслано сповіщення для події %s", key)
-
-    cutoff = now - timedelta(days=2)
-    cleaned = []
-    for key in notified:
-        try:
-            stamp = datetime.fromisoformat(key.split("|", 1)[0])
-            if stamp >= cutoff:
-                cleaned.append(key)
-        except ValueError:
-            pass
-
-    if cleaned != state.get("notified", []) or changed:
-        state["notified"] = cleaned
-        save_state(state)
-
-
-async def main():
-    if not BOT_TOKEN or not CHAT_ID:
-        raise SystemExit(
-            "Заповни TELEGRAM_BOT_TOKEN і TELEGRAM_CHAT_ID у змінних середовища або .env."
-        )
-
-    if RUN_ONCE:
-        await check_once()
-        return
-
-    telegram_send(
-        "✅ Бот моніторингу графіка запущений.\n"
-        f"Черга: {QUEUE}\n"
-        f"Перевірка: кожні {CHECK_EVERY_SECONDS // 60} хв.\n"
-        "Сповіщення: одразу після виявлення нового майбутнього відключення."
-    )
-    while True:
-        try:
-            await check_once()
-        except Exception:
-            logging.exception("Помилка перевірки")
-        await asyncio.sleep(CHECK_EVERY_SECONDS)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-            
+                f"Інтервал: {start:%H:%M}–{end
+                                           
