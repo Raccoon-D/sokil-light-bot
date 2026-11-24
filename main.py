@@ -91,7 +91,6 @@ def extract_events(page_text):
         if not QUEUE_RE.search(line):
             continue
 
-        # Беремо поточний рядок і сусідні рядки цього ж запису таблиці
         neighbor_lines = lines[max(0, idx - 2) : min(len(lines), idx + 4)]
         block = " | ".join(neighbor_lines)
 
@@ -100,7 +99,6 @@ def extract_events(page_text):
 
         for m in ranges:
             sh, sm, eh, em = map(int, m.groups())
-            # Відсікаємо заголовки шкали на кшталт 00:00-12:00 або 12:00-24:00, якщо вони не схожі на інтервал відключення
             if (sh, sm, eh, em) in {(0, 0, 12, 0), (12, 0, 24, 0)}:
                 continue
 
@@ -123,12 +121,11 @@ async def fetch_site_text():
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page(locale="uk-UA", timezone_id="Europe/Kyiv")
-        await page.goto(SOURCE_URL, wait_until="networkidle", timeout=60000)
-        await page.wait_for_timeout(5000)
+        await page.goto(SOURCE_URL, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(8000)
 
         for frame in page.frames:
             try:
-                # Збираємо рядки таблиць через табуляцію, щоб колонки не злипалися
                 rows_text = await frame.evaluate(
                     """() => {
                         const rows = Array.from(document.querySelectorAll('tr'));
