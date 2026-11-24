@@ -323,5 +323,30 @@ async def check_once():
         save_state(state)
 
 
-async def main
-            
+async def main():
+    if not BOT_TOKEN or not CHAT_ID:
+        raise SystemExit(
+            "Заповни TELEGRAM_BOT_TOKEN і TELEGRAM_CHAT_ID у змінних середовища або .env."
+        )
+
+    if RUN_ONCE:
+        await check_once()
+        return
+
+    telegram_send(
+        "✅ Бот моніторингу графіка запущений.\n"
+        f"Черга: {QUEUE}\n"
+        f"Перевірка: кожні {CHECK_EVERY_SECONDS // 60} хв.\n"
+        "Сповіщення: одразу після виявлення нового майбутнього відключення."
+    )
+    while True:
+        try:
+            await check_once()
+        except Exception:
+            logging.exception("Помилка перевірки")
+        await asyncio.sleep(CHECK_EVERY_SECONDS)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+    
