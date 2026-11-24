@@ -271,17 +271,9 @@ async def check_once():
     events = extract_events(text)
 
     if DEBUG_REPORT:
-        preview = "\n".join(line.strip() for line in text.splitlines() if line.strip())[:3200]
-        events_str = (
-            "\n".join(f"• {s:%Y-%m-%d %H:%M}–{e:%H:%M}" for s, e in events)
-            if events
-            else "нічого не знайдено"
-        )
-        telegram_send(
-            f"🛠 Діагностичний звіт (черга {QUEUE})\n\n"
-            f"Знайдені інтервали:\n{events_str}\n\n"
-            f"Що побачив бот на сторінці:\n{preview}"
-        )
+        preview = " | ".join(line.strip() for line in text.splitlines() if line.strip())[:2500]
+        events_str = ", ".join(f"{s:%Y-%m-%d %H:%M}-{e:%H:%M}" for s, e in events) or "none"
+        telegram_send(f"DEBUG ({QUEUE}): {events_str}\n\n{preview}")
 
     if not events:
         logging.info(
@@ -339,5 +331,17 @@ async def main():
     telegram_send(
         "✅ Бот моніторингу графіка запущений.\n"
         f"Черга: {QUEUE}\n"
-        f"
+        f"Перевірка: кожні {CHECK_EVERY_SECONDS // 60} хв.\n"
+        "Сповіщення: одразу після виявлення нового майбутнього відключення."
+    )
+    while True:
+        try:
+            await check_once()
+        except Exception:
+            logging.exception("Помилка перевірки")
+        await asyncio.sleep(CHECK_EVERY_SECONDS)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
             
