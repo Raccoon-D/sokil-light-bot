@@ -320,5 +320,19 @@ async def main():
         return
 
     telegram_send(
-        "✅ Бот мо
-            
+        "✅ Бот моніторингу графіка запущений.\n"
+        f"Черга: {QUEUE}\n"
+        f"Перевірка: кожні {CHECK_EVERY_SECONDS // 60} хв.\n"
+        "Сповіщення: одразу після виявлення нового майбутнього відключення."
+    )
+    while True:
+        try:
+            await check_once()
+        except Exception:
+            logging.exception("Помилка перевірки")
+        await asyncio.sleep(CHECK_EVERY_SECONDS)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+    
