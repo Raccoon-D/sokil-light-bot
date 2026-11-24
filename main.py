@@ -20,6 +20,7 @@ QUEUE = "4.1"
 TZ = ZoneInfo("Europe/Kyiv")
 STATE_FILE = Path("state.json")
 PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
+DEBUG_REPORT = os.getenv("DEBUG_REPORT", "1").strip().lower() in {"1", "true", "yes"}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,7 +37,7 @@ TIME_RE = re.compile(
 )
 DATE_DMY_RE = re.compile(r"(?<!\d)(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?!\d)")
 DATE_YMD_RE = re.compile(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)")
-QUEUE_RE = re.compile(r"(?<![\d.])4[.,]1(?!\d)")
+QUEUE_STRICT_RE = re.compile(r"(?<![\d.])4\.1(?!\d)")
 
 
 def build_camoufox_proxy(proxy_url):
@@ -96,7 +97,7 @@ def parse_date(text):
 
 
 def extract_events(page_text):
-    lines = [re.sub(r"\s+", " ", line).strip() for line in page_text.splitlines()]
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in page_text.splitlines()]
     lines = [line for line in lines if line]
 
     now = datetime.now(TZ)
@@ -108,14 +109,16 @@ def extract_events(page_text):
         if found_date and not TIME_RE.search(line):
             current_date = found_date
 
-        if not QUEUE_RE.search(line):
+        parts = [p.strip() for p in re.split(r"\s*\|\s*|\t+", line) if p.strip()]
+        has_queue = ("4.1" in parts) or bool(QUEUE_STRICT_RE.search(line))
+        if not has_queue:
             continue
 
-        neighbor_lines = lines[max(0, idx - 2) : min(len(lines), idx + 4)]
+        neighbor_lines = lines[max(0, idx - 1) : min(len(lines), idx + 3)]
         block = " | ".join(neighbor_lines)
 
-        row_date = parse_date(block) or current_date
-        ranges = list(TIME_RE.finditer(block))
+        row_date = parse_date(line) or parse_date(block) or current_date
+        ranges = list(TIME_RE.finditer(line)) or list(TIME_RE.finditer(block))
 
         for m in ranges:
             sh, sm, eh, em = map(int, m.groups())
@@ -208,7 +211,7 @@ async def fetch_site_text():
                         const rows = Array.from(document.querySelectorAll('tr'));
                         const tablePart = rows
                             .map(r => Array.from(r.querySelectorAll('th, td'))
-                                .map(c => c.innerText.trim())
+                                .map(c => c.innerText.replace(/\\s+/g, ' ').trim())
                                 .filter(Boolean)
                                 .join(' | '))
                             .filter(Boolean)
@@ -266,6 +269,20 @@ async def check_once():
         )
 
     events = extract_events(text)
+
+    if DEBUG_REPORT:
+        preview = "\n".join(line.strip() for line in text.splitlines() if line.strip())[:3200]
+        events_str = (
+            "\n".join(f"• {s:%Y-%m-%d %H:%M}–{e:%H:%M}" for s, e in events)
+            if events
+            else "нічого не знайдено"
+        )
+        telegram_send(
+            f"🛠 Діагностичний звіт (черга {QUEUE})\n\n"
+            f"Знайдені інтервали:\n{events_str}\n\n"
+            f"Що побачив бот на сторінці:\n{preview}"
+        )
+
     if not events:
         logging.info(
             "Майбутніх або активних інтервалів для черги %s не знайдено.",
@@ -322,17 +339,5 @@ async def main():
     telegram_send(
         "✅ Бот моніторингу графіка запущений.\n"
         f"Черга: {QUEUE}\n"
-        f"Перевірка: кожні {CHECK_EVERY_SECONDS // 60} хв.\n"
-        "Сповіщення: одразу після виявлення нового майбутнього відключення."
-    )
-    while True:
-        try:
-            await check_once()
-        except Exception:
-            logging.exception("Помилка перевірки")
-        await asyncio.sleep(CHECK_EVERY_SECONDS)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-    
+        f"
+            
