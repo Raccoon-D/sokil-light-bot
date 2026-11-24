@@ -8,8 +8,9 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
+from camoufox import AsyncCamoufox
+from camoufox_captcha import solve_captcha
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright
 
 load_dotenv()
 
@@ -17,11 +18,7 @@ SOURCE_URL = "https://energy.volyn.ua/spozhyvacham/perervy-u-elektropostachanni/
 QUEUE = "4.1"
 TZ = ZoneInfo("Europe/Kyiv")
 STATE_FILE = Path("state.json")
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36"
-)
+PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -119,64 +116,31 @@ def extract_events(page_text):
 
 async def fetch_site_text():
     texts = []
-    xhr_chunks = []
+    camoufox_kwargs = {
+        "headless": True,
+        "geoip": True,
+        "i_know_what_im_doing": True,
+        "config": {"forceScopeAccess": True},
+        "disable_coop": True,
+    }
+    if PROXY_URL:
+        camoufox_kwargs["proxy"] = PROXY_URL
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+    async with AsyncCamoufox(**camoufox_kwargs) as browser:
+        page = await browser.new_page()
+        await page.goto(SOURCE_URL, wait_until="domcontentloaded", timeout=60000)
+
+        solved = await solve_captcha(
+            page,
+            captcha_type="cloudflare",
+            challenge_type="interstitial",
         )
-        context = await browser.new_context(
-            locale="uk-UA",
-            timezone_id="Europe/Kyiv",
-            user_agent=USER_AGENT,
-        )
-        page = await context.new_page()
-        await page.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-        )
-
-        async def handle_response(response):
-            try:
-                if response.request.resource_type in {"xhr", "fetch"}:
-                    body = await response.text()
-                    if body and ("4.1" in body or "4,1" in body or "ГПВ" in body or "2026" in body):
-                        xhr_chunks.append(body[:2000])
-            except Exception:
-                pass
-
-        page.on("response", handle_response)
-
-        await page.goto(
-            SOURCE_URL,
-            wait_until="domcontentloaded",
-            timeout=60000,
-        )
-
-        await page.wait_for_timeout(5000)
-
-        title = await page.title()
-        body = await page.locator("body").inner_text()
-
-        if (
-            "Just a moment" in title
-            or "Checking your browser" in body
-            or "Verify you are human" in body
-            or "challenges.cloudflare.com" in body
-        ):
-            await page.screenshot(
-                path="cloudflare_challenge.png",
-                full_page=True,
-            )
-            await browser.close()
-            raise RuntimeError(
-                "Cloudflare Challenge заблокував автоматичне "
-                "завантаження сайту. Скриншот збережено."
+        if not solved:
+            logging.warning(
+                "Cloudflare challenge не пройдено автоматично, пробуємо далі..."
             )
 
-        logging.info("Сторінка завантажена: %s", title)
-
-        await page.wait_for_timeout(7000)
+        await page.wait_for_timeout(8000)
 
         for frame in page.frames:
             try:
@@ -235,9 +199,7 @@ async def fetch_site_text():
             except Exception:
                 continue
 
-        await browser.close()
-
-    return "\n---\n".join(texts + xhr_chunks)
+    return "\n---\n".join(texts)
 
 
 def telegram_send(message):
@@ -271,6 +233,7 @@ async def check_once():
 
     if (
         "Триває перевірка безпеки" in text
+        or "Трохи зачекайте" in text
         or "Cloudflare" in text
         or "Ray ID:" in text
         or "Verify you are human" in text
