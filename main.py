@@ -17,6 +17,11 @@ SOURCE_URL = "https://energy.volyn.ua/spozhyvacham/perervy-u-elektropostachanni/
 QUEUE = "4.1"
 TZ = ZoneInfo("Europe/Kyiv")
 STATE_FILE = Path("state.json")
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -117,8 +122,19 @@ async def fetch_site_text():
     xhr_chunks = []
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page(locale="uk-UA", timezone_id="Europe/Kyiv")
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+        )
+        context = await browser.new_context(
+            locale="uk-UA",
+            timezone_id="Europe/Kyiv",
+            user_agent=USER_AGENT,
+        )
+        page = await context.new_page()
+        await page.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
 
         async def handle_response(response):
             try:
@@ -132,7 +148,7 @@ async def fetch_site_text():
         page.on("response", handle_response)
 
         await page.goto(SOURCE_URL, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(5000)
+        await page.wait_for_timeout(12000)
 
         for frame in page.frames:
             try:
@@ -301,4 +317,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-        
+    
