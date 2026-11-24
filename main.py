@@ -72,15 +72,11 @@ def parse_date(text):
 
 
 def extract_events(page_text):
-    """
-    Аналізує сторінку по рядках, щоб коректно прив'язати дату і час до черги 4.1.
-    """
     lines = [re.sub(r"\s+", " ", line).strip() for line in page_text.splitlines()]
     lines = [line for line in lines if line]
 
     now = datetime.now(TZ)
-    now_date = now.date()
-    current_date = now_date
+    current_date = now.date()
     events = []
 
     for idx, line in enumerate(lines):
@@ -118,6 +114,191 @@ def extract_events(page_text):
 
 async def fetch_site_text():
     texts = []
+    xhr_chunks = []
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page(locale="uk-UA", timezone_id="Europe/Kyiv")
+
+        async def handle_response(response):
+            try:
+                if response.request.resource_type in {"xhr", "fetch"}:
+                    body = await response.text()
+                    if body and ("4.1" in body or "4,1" in body or "ГПВ" in body or "2026" in body):
+                        xhr_chunks.append(body[:1000])
+            except Exception:
+                pass
+
+        page.on("response", handle_response)
+
+        await page.goto(SOURCE_URL, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(5000)
+
+        for frame in page.frames:
+            try:
+                selects = frame.locator("select")
+                count = await selects.count()
+                for i in range(count):
+                    sel = selects.nth(i)
+                    options = sel.locator("option")
+                    opt_count = await options.count()
+                    if opt_count > 1:
+                        val = await options.nth(opt_count - 1).get_attribute("value")
+                        if val:
+                            await sel.select_option(val)
+                            await page.wait_for_timeout(3000)
+            except Exception:
+                continue
+
+        for frame in page.frames:
+            try:
+                date_picker = frame.get_by_text("Виберіть дату ГПВ", exact=False)
+                if await date_picker.count() > 0:
+                    await date_picker.first.click(timeout=3000)
+                    await page.wait_for_timeout(1500)
+                    for target in (
+                        datetime.now(TZ).strftime("%Y-%m-%d"),
+                        (datetime.now(TZ) + timedelta(days=1)).strftime("%Y-%m-%d"),
+                        datetime.now(TZ).strftime("%d.%m.%Y"),
+                        (datetime.now(TZ) + timedelta(days=1)).strftime("%d.%m.%Y"),
+                    ):
+                        opt = frame.get_by_text(target, exact=False)
+                        if await opt.count() > 0:
+                            await opt.last.click(timeout=3000)
+                            await page.wait_for_timeout(4000)
+                            break
+            except Exception:
+                continue
+
+        for frame in page.frames:
+            try:
+                rows_text = await frame.evaluate(
+                    """() => {
+                        const rows = Array.from(document.querySelectorAll('tr'));
+                        const tablePart = rows
+                            .map(r => Array.from(r.querySelectorAll('th, td'))
+                                .map(c => c.innerText.trim())
+                                .filter(Boolean)
+                                .join(' | '))
+                            .filter(Boolean)
+                            .join('\\n');
+                        const bodyPart = document.body ? document.body.innerText : '';
+                        return (tablePart + '\\n' + bodyPart).trim();
+                    }"""
+                )
+                if rows_text:
+                    texts.append(rows_text)
+            except Exception:
+                continue
+
+        await browser.close()
+
+    return "\n---\n".join(texts + xhr_chunks)
+
+
+def telegram_send(message):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    response = requests.post(
+        url,
+        json={
+            "chat_id": CHAT_ID,
+            "text": message[:4000],
+            "disable_web_page_preview": True,
+        },
+        timeout=20,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("ok"):
+        raise RuntimeError(f"Telegram API error: {payload}")
+    return payload
+
+
+def event_key(start, end):
+    return f"{start.isoformat()}|{end.isoformat()}"
+
+
+async def check_once():
+    logging.info("Перевіряю офіційний графік для черги %s", QUEUE)
+    text = await fetch_site_text()
+    if not text.strip():
+        raise RuntimeError("Сайт не повернув текст графіка.")
+
+    events = extract_events(text)
+    if not events:
+        cleaned_lines = [
+            re.sub(r"\s+", " ", line).strip()
+            for line in text.splitlines()
+            if line.strip()
+        ]
+        preview = "\n".join(cleaned_lines[:20])[:1500]
+        telegram_send(
+            f"ℹ️ Інтервалів для черги {QUEUE} не знайдено.\n"
+            "Ось перші рядки, які бачить скрипт:\n\n"
+            f"{preview or 'Порожній текст'}"
+        )
+        return
+
+    now = datetime.now(TZ)
+    state = load_state()
+    notified = set(state.get("notified", []))
+    changed = False
+
+    for start, end in events:
+        key = event_key(start, end)
+        if key not in notified:
+            msg = (
+                "⚡️ Виявлено майбутнє відключення світла\n\n"
+                f"Черга: {QUEUE}\n"
+                f"Дата: {start:%Y-%m-%d}\n"
+                f"Інтервал: {start:%H:%M}–{end:%H:%M}\n\n"
+                "Джерело: Волиньобленерго\n"
+                "Фактичний час може відрізнятися від графіка."
+            )
+            telegram_send(msg)
+            notified.add(key)
+            changed = True
+            logging.info("Надіслано сповіщення для події %s", key)
+
+    cutoff = now - timedelta(days=2)
+    cleaned = []
+    for key in notified:
+        try:
+            stamp = datetime.fromisoformat(key.split("|", 1)[0])
+            if stamp >= cutoff:
+                cleaned.append(key)
+        except ValueError:
+            pass
+
+    if cleaned != state.get("notified", []) or changed:
+        state["notified"] = cleaned
+        save_state(state)
+
+
+async def main():
+    if not BOT_TOKEN or not CHAT_ID:
+        raise SystemExit(
+            "Заповни TELEGRAM_BOT_TOKEN і TELEGRAM_CHAT_ID у змінних середовища або .env."
+        )
+
+    if RUN_ONCE:
+        await check_once()
+        return
+
+    telegram_send(
+        "✅ Бот моніторингу графіка запущений.\n"
+        f"Черга: {QUEUE}\n"
+        f"Перевірка: кожні {CHECK_EVERY_SECONDS // 60} хв.\n"
+        "Сповіщення: одразу після виявлення нового майбутнього відключення."
+    )
+    while True:
+        try:
+            await check_once()
+        except Exception:
+            logging.exception("Помилка перевірки")
+        await asyncio.sleep(CHECK_EVERY_SECONDS)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
         
