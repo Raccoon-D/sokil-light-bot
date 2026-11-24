@@ -5,6 +5,7 @@ import os
 import re
 from datetime import datetime, date, time, timedelta
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
@@ -36,6 +37,27 @@ TIME_RE = re.compile(
 DATE_DMY_RE = re.compile(r"(?<!\d)(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?!\d)")
 DATE_YMD_RE = re.compile(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)")
 QUEUE_RE = re.compile(r"(?<![\d.])4[.,]1(?!\d)")
+
+
+def build_camoufox_proxy(proxy_url):
+    if not proxy_url:
+        return None
+    normalized = proxy_url if "://" in proxy_url else f"http://{proxy_url}"
+    parsed = urlparse(normalized)
+    if not parsed.hostname:
+        return {"server": normalized}
+
+    scheme = parsed.scheme or "http"
+    server = f"{scheme}://{parsed.hostname}"
+    if parsed.port:
+        server = f"{server}:{parsed.port}"
+
+    proxy_cfg = {"server": server}
+    if parsed.username:
+        proxy_cfg["username"] = unquote(parsed.username)
+    if parsed.password:
+        proxy_cfg["password"] = unquote(parsed.password)
+    return proxy_cfg
 
 
 def load_state():
@@ -123,8 +145,9 @@ async def fetch_site_text():
         "config": {"forceScopeAccess": True},
         "disable_coop": True,
     }
-    if PROXY_URL:
-        camoufox_kwargs["proxy"] = PROXY_URL
+    proxy_cfg = build_camoufox_proxy(PROXY_URL)
+    if proxy_cfg:
+        camoufox_kwargs["proxy"] = proxy_cfg
 
     async with AsyncCamoufox(**camoufox_kwargs) as browser:
         page = await browser.new_page()
@@ -297,19 +320,5 @@ async def main():
         return
 
     telegram_send(
-        "✅ Бот моніторингу графіка запущений.\n"
-        f"Черга: {QUEUE}\n"
-        f"Перевірка: кожні {CHECK_EVERY_SECONDS // 60} хв.\n"
-        "Сповіщення: одразу після виявлення нового майбутнього відключення."
-    )
-    while True:
-        try:
-            await check_once()
-        except Exception:
-            logging.exception("Помилка перевірки")
-        await asyncio.sleep(CHECK_EVERY_SECONDS)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-    
+        "✅ Бот мо
+            
