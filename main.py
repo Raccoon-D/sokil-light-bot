@@ -244,38 +244,79 @@ async def select_today_date(frame, page, target_date):
     return False
 
 
-async def _type_like_user(inp, page, value):
+async def _set_exact_input_value(inp, page, value):
     try:
         await inp.scroll_into_view_if_needed(timeout=4000)
     except Exception:
         pass
     await page.wait_for_timeout(150)
-    try:
-        await inp.click(timeout=3000)
-        await inp.fill("")
-        await inp.type(value, delay=65, timeout=5000)
-        await page.wait_for_timeout(300)
-        return True
-    except Exception:
-        pass
 
-    handle = await inp.element_handle(timeout=3000)
-    if handle:
-        await page.evaluate(
-            """([el, val]) => {
-                el.scrollIntoView({block: 'center', inline: 'center'});
-                el.focus();
-                el.value = '';
-                el.dispatchEvent(new Event('input', {bubbles: true}));
-                el.value = val;
-                el.dispatchEvent(new Event('input', {bubbles: true}));
-                el.dispatchEvent(new Event('change', {bubbles: true}));
-            }""",
-            [handle, value],
-        )
-        await page.wait_for_timeout(300)
-        return True
+    for _ in range(2):
+        try:
+            await inp.click(timeout=3000)
+            await inp.press("Control+A")
+            await inp.press("Backspace")
+            await inp.type(value, delay=65, timeout=5000)
+            await page.wait_for_timeout(200)
+            cur = ((await inp.input_value()) or "").strip()
+            if cur == value:
+                return True
+        except Exception:
+            pass
+
+        handle = await inp.element_handle(timeout=3000)
+        if handle:
+            await page.evaluate(
+                """([el, val]) => {
+                    el.scrollIntoView({block: 'center', inline: 'center'});
+                    el.focus();
+                    el.value = '';
+                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                    el.value = val;
+                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                }""",
+                [handle, value],
+            )
+            await page.wait_for_timeout(200)
+            try:
+                cur = ((await inp.input_value()) or "").strip()
+                if cur == value:
+                    return True
+            except Exception:
+                return True
     return False
+
+
+async def _get_address_inputs(frame):
+    # Шукаємо поля саме форми адреси (поруч із кнопкою "Вибрати"), відсортовані зверху вниз
+    handles = await frame.evaluate_handle(
+        """() => {
+            const btn = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], a')).find(el => {
+                const t = (el.innerText || el.value || '').trim();
+                const r = el.getBoundingClientRect();
+                return t.includes('Вибрати') && r.width > 0 && r.height > 0;
+            });
+            let container = btn ? (btn.closest('form') || btn.closest('section') || btn.parentElement?.parentElement || document.body) : document.body;
+            const isVisible = el => {
+                const r = el.getBoundingClientRect();
+                const s = window.getComputedStyle(el);
+                return r.width > 40 && r.height > 15 && s.display !== 'none' && s.visibility !== 'hidden';
+            };
+            let inputs = Array.from(container.querySelectorAll('input[type="text"], input:not([type])')).filter(isVisible);
+            if (inputs.length < 2) {
+                inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])')).filter(isVisible);
+            }
+            inputs.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+            return inputs;
+        }"""
+    )
+    arr = await handles.json_value()
+    count = len(arr) if isinstance(arr, list) else 0
+    result = []
+    for idx in range(count):
+        result.append(handles.nth(idx))
+    return result
 
 
 async def click_select_button(frame, page):
@@ -336,18 +377,27 @@ async def _wait_for_filter_result(page, timeout_ms=10000):
 async def fill_address_in_frame(frame, page, target_date):
     await select_today_date(frame, page, target_date)
 
-    inputs = frame.locator("input[type='text']:visible, input:not([type]):visible")
-    cnt = await inputs.count()
-    if cnt == 0:
+    addr_inputs = await _get_address_inputs(frame)
+    if not addr_inputs:
         return False
 
     try:
-        town_inp = inputs.nth(0)
-        await _type_like_user(town_inp, page, TOWN_NAME)
+        town_inp = addr_inputs[0]
+        await _set_exact_input_value(town_inp, page, TOWN_NAME)
+        await page.wait_for_timeout(300)
 
-        if cnt >= 2:
-            street_inp = inputs.nth(1)
-            await _type_like_user(street_inp, page, STREET_NAME)
+        if len(addr_inputs) >= 2:
+            street_inp = addr_inputs[1]
+            await _set_exact_input_value(street_inp, page, STREET_NAME)
+            await page.wait_for_timeout(300)
+
+        # Повторно перевіряємо, чи в першому полі лишився саме TOWN_NAME
+        try:
+            town_val = ((await town_inp.input_value()) or "").strip()
+            if town_val != TOWN_NAME:
+                await _set_exact_input_value(town_inp, page, TOWN_NAME)
+        except Exception:
+            pass
 
         clicked = await click_select_button(frame, page)
         if clicked:
@@ -395,7 +445,7 @@ async def capture_two_screenshots(page):
         }"""
     )
 
-    # 1-й скріншот: сітка графіків ГПВ (як було раніше)
+    # 1-й скріншот: сітка графіків ГПВ
     await page.set_viewport_size({"width": 1366, "height": 2200})
     grid_box = await page.evaluate(
         """() => {
