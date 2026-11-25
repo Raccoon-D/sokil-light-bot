@@ -433,7 +433,6 @@ async def capture_two_screenshots(page):
     )
     await page.set_viewport_size({"width": 1366, "height": 2200})
 
-    # 1-й скріншот: сітки графіків ГПВ
     grid_box = await page.evaluate(
         """() => {
             let minY = Infinity, maxBottom = -Infinity, minX = Infinity, maxRight = -Infinity;
@@ -461,7 +460,6 @@ async def capture_two_screenshots(page):
     )
     await _safe_clipped_shot(page, SHOT_GRIDS_FILE, grid_box)
 
-    # 2-й скріншот: пошук адреси / результати (включно з фреймами)
     search_y = None
     for frame in page.frames:
         try:
@@ -662,3 +660,28 @@ async def check_once():
                 f"Черга: {QUEUE}\nКоли: {day_label(start.date(), today)} ({start:%Y-%m-%d})\n"
                 f"Інтервал: {start:%H:%M}–{end:%H:%M}\n\nДжерело: Волиньобленерго"
             )
+            notified.add(key)
+            changed = True
+
+    if changed:
+        state["notified"] = sorted(notified)
+        save_state(state)
+
+
+async def main():
+    if not BOT_TOKEN or not CHAT_ID:
+        raise SystemExit("Заповни TELEGRAM_BOT_TOKEN і TELEGRAM_CHAT_ID.")
+    if RUN_ONCE:
+        await check_once()
+        return
+    telegram_send(f"✅ Бот моніторингу графіка запущений.\nЧерга: {QUEUE}\nПеревірка: кожні {CHECK_EVERY_SECONDS // 60} хв.")
+    while True:
+        try:
+            await check_once()
+        except Exception:
+            logging.exception("Помилка перевірки")
+        await asyncio.sleep(CHECK_EVERY_SECONDS)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
