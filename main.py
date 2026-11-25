@@ -342,7 +342,7 @@ async def click_select_button(frame, page):
     return False
 
 
-async def _find_street_input(frame, town_inp):
+async def _find_street_input(frame):
     inputs = frame.locator("input[type='text']:visible, input:not([type]):visible")
     cnt = await inputs.count()
     for idx in range(cnt):
@@ -358,12 +358,7 @@ async def _find_street_input(frame, town_inp):
         except Exception:
             continue
     if cnt >= 2:
-        last_inp = inputs.nth(cnt - 1)
-        try:
-            if ((await last_inp.input_value()) or "").strip().lower() != TOWN_NAME.lower():
-                return last_inp
-        except Exception:
-            return last_inp
+        return inputs.nth(cnt - 1)
     return None
 
 
@@ -381,7 +376,7 @@ async def fill_address_in_frame(frame, page, target_date):
         await _pick_autocomplete_option(frame, page, TOWN_NAME)
         await page.wait_for_timeout(1000)
 
-        street_inp = await _find_street_input(frame, town_inp)
+        street_inp = await _find_street_input(frame)
         if street_inp is not None:
             await _safe_fill_input(street_inp, page, STREET_NAME)
             await page.wait_for_timeout(1500)
@@ -438,6 +433,7 @@ async def capture_two_screenshots(page):
     )
     await page.set_viewport_size({"width": 1366, "height": 2200})
 
+    # 1-й скріншот: сітки графіків ГПВ
     grid_box = await page.evaluate(
         """() => {
             let minY = Infinity, maxBottom = -Infinity, minX = Infinity, maxRight = -Infinity;
@@ -465,21 +461,47 @@ async def capture_two_screenshots(page):
     )
     await _safe_clipped_shot(page, SHOT_GRIDS_FILE, grid_box)
 
-    scroll_target_y = await page.evaluate(
-        """() => {
-            const target = Array.from(document.querySelectorAll('h1, h2, h3, h4, p, div, table'))
-                .find(el => {
-                    const r = el.getBoundingClientRect();
-                    const t = (el.innerText || '');
-                    return r.height > 0 && r.width > 100 && (t.includes('Пошук вашої адреси') || t.includes('Фільтр:'));
-                });
-            if (!target) return 700;
-            const r = target.getBoundingClientRect();
-            return Math.max(0, r.top + window.scrollY - 60);
-        }"""
-    )
+    # 2-й скріншот: пошук адреси / результати (включно з фреймами)
+    search_y = None
+    for frame in page.frames:
+        try:
+            pos = await frame.evaluate(
+                """() => {
+                    const els = Array.from(document.querySelectorAll('h1, h2, h3, h4, p, div, button, table, tr'));
+                    const hit = els.find(el => {
+                        const r = el.getBoundingClientRect();
+                        const t = (el.innerText || el.value || '').trim();
+                        return r.height > 0 && r.width > 50 && (
+                            t.includes('Пошук вашої адреси') ||
+                            t.includes('Фільтр:') ||
+                            t === 'Вибрати'
+                        );
+                    });
+                    if (!hit) return null;
+                    const r = hit.getBoundingClientRect();
+                    let offsetY = 0;
+                    let win = window;
+                    while (win && win !== win.parent) {
+                        const frameEl = win.frameElement;
+                        if (!frameEl) break;
+                        const fr = frameEl.getBoundingClientRect();
+                        offsetY += fr.top + win.parent.scrollY;
+                        win = win.parent;
+                    }
+                    return r.top + window.scrollY + offsetY;
+                }"""
+            )
+            if isinstance(pos, (int, float)) and pos == pos and abs(pos) != float("inf"):
+                search_y = max(0.0, float(pos) - 120.0)
+                break
+        except Exception:
+            continue
+
     await page.set_viewport_size({"width": 1366, "height": 1100})
-    await page.evaluate("(y) => window.scrollTo(0, y)", float(scroll_target_y or 700.0))
+    if search_y is not None:
+        await page.evaluate("(y) => window.scrollTo(0, y)", search_y)
+    else:
+        await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight * 0.55)")
     await page.wait_for_timeout(400)
     await page.screenshot(path=str(SHOT_SEARCH_FILE), full_page=False)
 
@@ -640,28 +662,3 @@ async def check_once():
                 f"Черга: {QUEUE}\nКоли: {day_label(start.date(), today)} ({start:%Y-%m-%d})\n"
                 f"Інтервал: {start:%H:%M}–{end:%H:%M}\n\nДжерело: Волиньобленерго"
             )
-            notified.add(key)
-            changed = True
-
-    if changed:
-        state["notified"] = sorted(notified)
-        save_state(state)
-
-
-async def main():
-    if not BOT_TOKEN or not CHAT_ID:
-        raise SystemExit("Заповни TELEGRAM_BOT_TOKEN і TELEGRAM_CHAT_ID.")
-    if RUN_ONCE:
-        await check_once()
-        return
-    telegram_send(f"✅ Бот моніторингу графіка запущений.\nЧерга: {QUEUE}\nПеревірка: кожні {CHECK_EVERY_SECONDS // 60} хв.")
-    while True:
-        try:
-            await check_once()
-        except Exception:
-            logging.exception("Помилка перевірки")
-        await asyncio.sleep(CHECK_EVERY_SECONDS)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
