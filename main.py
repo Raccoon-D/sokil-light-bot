@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -22,7 +21,8 @@ TOWN_NAME = "Сокіл"
 STREET_NAME = "Молодіжна"
 TZ = ZoneInfo("Europe/Kyiv")
 STATE_FILE = Path("state.json")
-SCREENSHOT_FILE = Path("schedule.png")
+SHOT_SEARCH_FILE = Path("schedule_search.png")
+SHOT_GRIDS_FILE = Path("schedule_grids.png")
 PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
 SEND_TEXT_SUMMARY = os.getenv("SEND_TEXT_SUMMARY", "1").strip().lower() in {"1", "true", "yes"}
 
@@ -70,11 +70,10 @@ def load_state():
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         if isinstance(data, dict):
             data.setdefault("notified", [])
-            data.setdefault("last_shot_hash", "")
             return data
     except (FileNotFoundError, json.JSONDecodeError):
         pass
-    return {"notified": [], "last_shot_hash": ""}
+    return {"notified": []}
 
 
 def save_state(state):
@@ -166,84 +165,6 @@ def extract_events(page_text, default_date):
     return sorted(unique.values(), key=lambda x: x[0])
 
 
-async def extract_grid_events_from_dom(page, schedule_date):
-    now = datetime.now(TZ)
-    grid_events = []
-
-    for frame in page.frames:
-        try:
-            raw_slots = await frame.evaluate(
-                """() => {
-                    const out = [];
-                    const tables = Array.from(document.querySelectorAll('table'));
-                    for (const tbl of tables) {
-                        const headers = Array.from(tbl.querySelectorAll('thead tr th, tr:first-child th, tr:first-child td'))
-                            .map(el => el.innerText.replace(/\\s+/g, ' ').trim());
-                        const rows = Array.from(tbl.querySelectorAll('tbody tr, tr'));
-                        let activeQueue = '';
-                        for (const tr of rows) {
-                            const cells = Array.from(tr.querySelectorAll('th, td'));
-                            if (!cells.length) continue;
-                            const firstText = cells[0].innerText.replace(/\\s+/g, ' ').trim();
-                            if (/^[1-6]$/.test(firstText)) {
-                                activeQueue = firstText;
-                            }
-                            const secondText = cells.length > 1 ? cells[1].innerText.replace(/\\s+/g, ' ').trim() : '';
-                            const rowLabel = `${activeQueue}.${secondText}`;
-                            if (activeQueue === '4' && (secondText === '1' || rowLabel.includes('4.1'))) {
-                                cells.forEach((cell, idx) => {
-                                    const style = window.getComputedStyle(cell);
-                                    const cls = (cell.className || '').toString().toLowerCase();
-                                    const bg = style.backgroundColor || '';
-                                    const dataAttr = JSON.stringify(cell.dataset || {}).toLowerCase();
-                                    const isOff = (
-                                        cls.includes('off') ||
-                                        cls.includes('out') ||
-                                        cls.includes('disable') ||
-                                        cls.includes('active') ||
-                                        cls.includes('dark') ||
-                                        dataAttr.includes('off') ||
-                                        dataAttr.includes('1') ||
-                                        /rgb\\((\\d+),\\s*(\\d+),\\s*(\\d+)\\)/.test(bg) && (() => {
-                                            const m = bg.match(/rgb\\((\\d+),\\s*(\\d+),\\s*(\\d+)\\)/);
-                                            const r = Number(m[1]), g = Number(m[2]), b = Number(m[3]);
-                                            return (r + g + b) < 420 && Math.max(r, g, b) - Math.min(r, g, b) < 45;
-                                        })()
-                                    );
-                                    if (isOff && idx >= 2) {
-                                        out.push({
-                                            idx,
-                                            header: headers[idx] || '',
-                                            text: cell.innerText.trim(),
-                                        });
-                                    }
-                                });
-                            }
-                        }
-                    }
-                    return out;
-                }"""
-            )
-            for item in raw_slots or []:
-                hdr = item.get("header", "")
-                m = TIME_RE.search(hdr)
-                if m:
-                    sh, sm, eh, em = map(int, m.groups())
-                    start = datetime.combine(schedule_date, time(sh, sm), TZ)
-                    end = datetime.combine(schedule_date, time(eh, em), TZ)
-                    if end <= start:
-                        end += timedelta(days=1)
-                    if end > now:
-                        grid_events.append((start, end))
-        except Exception:
-            continue
-
-    unique = {}
-    for start, end in grid_events:
-        unique[(start.isoformat(), end.isoformat())] = (start, end)
-    return sorted(unique.values(), key=lambda x: x[0])
-
-
 async def close_accessibility_modal(page):
     for frame in page.frames:
         try:
@@ -258,50 +179,110 @@ async def close_accessibility_modal(page):
             continue
 
 
+async def click_select_button(frame, page):
+    candidates = frame.locator(
+        "button:has-text('Вибрати'), input[type='submit'][value*='Вибрати'], "
+        "input[type='button'][value*='Вибрати'], a:has-text('Вибрати'), "
+        "button:has-text('Знайти'), input[type='submit'][value*='Знайти']"
+    )
+    cnt = await candidates.count()
+    for i in range(cnt):
+        btn = candidates.nth(i)
+        try:
+            if await btn.is_visible():
+                await btn.scroll_into_view_if_needed(timeout=3000)
+                await page.wait_for_timeout(300)
+                await btn.click(timeout=4000)
+                await page.wait_for_timeout(4500)
+                logging.info("Натиснуто кнопку 'Вибрати'.")
+                return True
+        except Exception:
+            continue
+
+    # Запасний варіант через JS по тексту "Вибрати"
+    try:
+        clicked_js = await frame.evaluate(
+            """() => {
+                const els = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], a'));
+                const target = els.find(el => {
+                    const t = (el.innerText || el.value || '').trim();
+                    const r = el.getBoundingClientRect();
+                    return (t === 'Вибрати' || t.includes('Вибрати')) && r.width > 0 && r.height > 0;
+                });
+                if (!target) return false;
+                target.scrollIntoView({block: 'center'});
+                target.click();
+                return true;
+            }"""
+        )
+        if clicked_js:
+            await page.wait_for_timeout(4500)
+            logging.info("Натиснуто кнопку 'Вибрати' через JS.")
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
 async def fill_address_in_frame(frame, page):
-    inputs = frame.locator("input:visible")
-    inp_count = await inputs.count()
+    text_inputs = frame.locator("input[type='text']:visible, input:not([type]):visible")
+    inp_count = await text_inputs.count()
     if inp_count == 0:
         return False
 
     try:
-        town_inp = inputs.nth(0)
+        town_inp = text_inputs.nth(0)
+        await town_inp.scroll_into_view_if_needed(timeout=3000)
         await town_inp.click(timeout=3000)
-        await town_inp.fill(TOWN_NAME)
-        await page.wait_for_timeout(1500)
+        await town_inp.fill("")
+        await town_inp.type(TOWN_NAME, delay=60)
+        await page.wait_for_timeout(1200)
 
         town_opt = frame.locator("[role='option'], .autocomplete-item, li").get_by_text(
             TOWN_NAME, exact=False
         )
         if await town_opt.count() > 0:
-            await town_opt.first.click(timeout=3000)
-            await page.wait_for_timeout(1000)
+            try:
+                if await town_opt.first.is_visible():
+                    await town_opt.first.click(timeout=2000)
+                    await page.wait_for_timeout(700)
+            except Exception:
+                pass
 
         if inp_count >= 2:
-            street_inp = inputs.nth(1)
+            street_inp = text_inputs.nth(1)
+            await street_inp.scroll_into_view_if_needed(timeout=3000)
             await street_inp.click(timeout=3000)
-            await street_inp.fill(STREET_NAME)
-            await page.wait_for_timeout(1500)
+            await street_inp.fill("")
+            await street_inp.type(STREET_NAME, delay=60)
+            await page.wait_for_timeout(1200)
 
             street_opt = frame.locator("[role='option'], .autocomplete-item, li").get_by_text(
                 STREET_NAME, exact=False
             )
             if await street_opt.count() > 0:
-                await street_opt.first.click(timeout=3000)
-                await page.wait_for_timeout(1000)
+                try:
+                    if await street_opt.first.is_visible():
+                        await street_opt.first.click(timeout=2000)
+                        await page.wait_for_timeout(700)
+                except Exception:
+                    pass
 
-        find_btn = frame.locator("button:has-text('Знайти'), input[type='submit'][value*='Знайти']")
-        if await find_btn.count() > 0 and await find_btn.first.is_visible():
-            await find_btn.first.click(timeout=3000)
-            await page.wait_for_timeout(4000)
-            return True
+        try:
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(300)
+        except Exception:
+            pass
+
+        return await click_select_button(frame, page)
     except Exception as e:
-        logging.debug(f"Помилка заповнення фрейму: {e}")
+        logging.warning("Помилка заповнення форми: %s", e)
 
     return False
 
 
-async def capture_schedule_screenshot(page):
+async def capture_two_screenshots(page):
     await page.evaluate(
         """() => {
             const hideSelectors = [
@@ -316,35 +297,86 @@ async def capture_schedule_screenshot(page):
         }"""
     )
 
-    best_idx = await page.evaluate(
+    await page.set_viewport_size({"width": 1366, "height": 1600})
+
+    # 1-й скріншот: блок пошуку адреси та результат під ним
+    search_box = await page.evaluate(
         """() => {
-            const imgs = Array.from(document.querySelectorAll('img'));
-            let bestIndex = -1;
-            let bestArea = 0;
-            imgs.forEach((img, idx) => {
-                const rect = img.getBoundingClientRect();
-                const src = (img.currentSrc || img.src || '').toLowerCase();
-                if (src.includes('logo') || src.includes('icon')) return;
-                if (rect.width >= 450 && rect.height >= 350) {
-                    const area = rect.width * rect.height;
-                    if (area > bestArea) {
-                        bestArea = area;
-                        bestIndex = idx;
+            const els = Array.from(document.querySelectorAll('section, article, main, div, form'));
+            for (const el of els) {
+                const txt = (el.innerText || '');
+                if (txt.includes('Пошук вашої адреси') || (txt.includes('Вибрати') && txt.includes('вулиц'))) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width >= 400 && r.height >= 160 && r.height <= 1400) {
+                        return {
+                            x: r.x + window.scrollX,
+                            y: r.y + window.scrollY,
+                            width: r.width,
+                            height: r.height,
+                        };
                     }
                 }
-            });
-            return bestIndex;
+            }
+            return null;
         }"""
     )
 
-    if best_idx is not None and best_idx >= 0:
-        img_loc = page.locator("img").nth(best_idx)
-        await img_loc.scroll_into_view_if_needed(timeout=4000)
-        await page.wait_for_timeout(500)
-        await img_loc.screenshot(path=str(SCREENSHOT_FILE))
-        return
+    if search_box:
+        sy = max(0.0, float(search_box["y"]) - 20.0)
+        sh = min(1150.0, max(320.0, float(search_box["height"]) + 80.0))
+        sx = max(0.0, float(search_box["x"]) - 10.0)
+        sw = min(1366.0, float(search_box["width"]) + 20.0)
+        await page.evaluate("(y) => window.scrollTo(0, y)", sy)
+        await page.wait_for_timeout(300)
+        await page.screenshot(
+            path=str(SHOT_SEARCH_FILE),
+            clip={"x": sx, "y": sy, "width": sw, "height": sh},
+        )
+    else:
+        await page.screenshot(path=str(SHOT_SEARCH_FILE), full_page=False)
 
-    await page.screenshot(path=str(SCREENSHOT_FILE), full_page=False)
+    # 2-й скріншот: область сітки графіка
+    grid_box = await page.evaluate(
+        """() => {
+            const els = Array.from(document.querySelectorAll('section, article, main, div, img, table'));
+            let best = null;
+            let bestArea = Infinity;
+            for (const el of els) {
+                const txt = (el.innerText || '');
+                const r = el.getBoundingClientRect();
+                const isGraphBlock = (txt.includes('00:00') || txt.includes('12:00') || txt.includes('ГПВ'));
+                if (!isGraphBlock && el.tagName !== 'IMG') continue;
+                if (r.width < 450 || r.height < 260 || r.height > 2400) continue;
+                const area = r.width * r.height;
+                if (area < bestArea) {
+                    bestArea = area;
+                    best = {
+                        x: r.x + window.scrollX,
+                        y: r.y + window.scrollY,
+                        width: r.width,
+                        height: r.height,
+                    };
+                }
+            }
+            return best;
+        }"""
+    )
+
+    if grid_box:
+        gy = max(0.0, float(grid_box["y"]) - 40.0)
+        gh = min(1800.0, max(350.0, float(grid_box["height"]) + 60.0))
+        gx = max(0.0, float(grid_box["x"]) - 10.0)
+        gw = min(1366.0, float(grid_box["width"]) + 20.0)
+        await page.evaluate("(y) => window.scrollTo(0, y)", gy)
+        await page.wait_for_timeout(300)
+        await page.screenshot(
+            path=str(SHOT_GRIDS_FILE),
+            clip={"x": gx, "y": gy, "width": gw, "height": gh},
+        )
+    else:
+        await page.screenshot(path=str(SHOT_GRIDS_FILE), full_page=False)
+
+    return SHOT_SEARCH_FILE, SHOT_GRIDS_FILE
 
 
 async def fetch_site_data():
@@ -410,7 +442,9 @@ async def fetch_site_data():
 
         for frame in page.frames:
             try:
-                await fill_address_in_frame(frame, page)
+                clicked = await fill_address_in_frame(frame, page)
+                if clicked:
+                    break
             except Exception:
                 continue
 
@@ -439,14 +473,14 @@ async def fetch_site_data():
 
         full_text = "\n---\n".join(texts)
         schedule_date = extract_schedule_date(full_text, datetime.now(TZ).date())
-        dom_events = await extract_grid_events_from_dom(page, schedule_date)
 
         try:
-            await capture_schedule_screenshot(page)
+            search_shot, grids_shot = await capture_two_screenshots(page)
         except Exception as e:
-            logging.error("Не вдалося зробити скріншот: %s", e)
+            logging.error("Не вдалося зробити скріншоти: %s", e)
+            search_shot, grids_shot = SHOT_SEARCH_FILE, SHOT_GRIDS_FILE
 
-    return full_text, SCREENSHOT_FILE, schedule_date, dom_events
+    return full_text, search_shot, grids_shot, schedule_date
 
 
 def day_label(target_date, today):
@@ -498,9 +532,22 @@ def event_key(start, end):
     return f"{start.isoformat()}|{end.isoformat()}"
 
 
+def has_no_outages_phrase(page_text):
+    lower = page_text.lower()
+    return any(
+        phrase in lower
+        for phrase in [
+            "відключень не заплановано",
+            "немає відключень",
+            "графік відсутній",
+            "не знайдено",
+        ]
+    )
+
+
 async def check_once():
     logging.info("Перевіряю офіційний графік для черги %s", QUEUE)
-    text, shot_path, schedule_date, dom_events = await fetch_site_data()
+    text, search_shot, grids_shot, schedule_date = await fetch_site_data()
     now = datetime.now(TZ)
     today = now.date()
     state = load_state()
@@ -520,103 +567,26 @@ async def check_once():
             "Cloudflare Challenge: графік недоступний для бота."
         )
 
-    text_events = extract_events(text, schedule_date)
-    merged = {(s.isoformat(), e.isoformat()): (s, e) for s, e in (dom_events + text_events)}
-    all_day_events = sorted(merged.values(), key=lambda x: x[0])
-    future_events = [(s, e) for s, e in all_day_events if e > now]
-
+    events = extract_events(text, schedule_date)
     when_word = day_label(schedule_date, today)
     update_stamp = extract_update_stamp(text)
 
-    if shot_path.exists():
-        shot_hash = hashlib.md5(shot_path.read_bytes()).hexdigest()
-        caption = (
-            f"Графік ({QUEUE}) на {schedule_date:%d.%m.%Y} ({when_word})\n"
-            f"Оновлено на сайті: {update_stamp}"
-        )
+    if search_shot.exists():
         try:
-            telegram_send_photo(shot_path, caption)
-            state["last_shot_hash"] = shot_hash
-            changed = True
-            logging.info("Надіслано скріншот графіка.")
+            telegram_send_photo(
+                search_shot,
+                f"Пошук ({TOWN_NAME}, {STREET_NAME}) | {when_word} ({schedule_date:%d.%m.%Y})\nОновлено: {update_stamp}",
+            )
         except Exception as e:
-            logging.error("Не вдалося надіслати скріншот: %s", e)
+            logging.error("Не вдалося надіслати скріншот пошуку: %s", e)
 
-    if SEND_TEXT_SUMMARY:
-        if all_day_events:
-            lines_txt = "\n".join(
-                f"• {s:%H:%M}–{e:%H:%M}" + (" (вже минуло)" if e <= now else "")
-                for s, e in all_day_events
-            )
-            summary_msg = (
-                f"⚡️ Черга {QUEUE} ({TOWN_NAME}, {STREET_NAME}) — графік на {when_word} ({schedule_date:%d.%m.%Y})\n"
-                f"Відключення світла на {when_word}:\n{lines_txt}\n"
-                f"Оновлено на сайті: {update_stamp}"
-            )
-        else:
-            summary_msg = (
-                f"ℹ️ Черга {QUEUE} ({TOWN_NAME}, {STREET_NAME}) — графік на {when_word} ({schedule_date:%d.%m.%Y})\n"
-                f"Оновлено на сайті: {update_stamp}\n"
-                f"Графік на фото (перевір сітку по черзі {QUEUE} на {when_word})."
-            )
-        telegram_send(summary_msg)
-
-    notified = set(state.get("notified", []))
-
-    for start, end in future_events:
-        key = event_key(start, end)
-        if key not in notified:
-            msg = (
-                "⚡️ Виявлено майбутнє відключення світла\n\n"
-                f"Черга: {QUEUE}\n"
-                f"Коли: {day_label(start.date(), today)} ({start:%Y-%m-%d})\n"
-                f"Інтервал: {start:%H:%M}–{end:%H:%M}\n\n"
-                "Джерело: Волиньобленерго\n"
-                "Фактичний час може відрізнятися від графіка."
-            )
-            telegram_send(msg)
-            notified.add(key)
-            changed = True
-            logging.info("Надіслано сповіщення для події %s", key)
-
-    cutoff = now - timedelta(days=2)
-    cleaned = []
-    for key in notified:
+    if grids_shot.exists():
         try:
-            stamp = datetime.fromisoformat(key.split("|", 1)[0])
-            if stamp >= cutoff:
-                cleaned.append(key)
-        except ValueError:
-            pass
+            telegram_send_photo(
+                grids_shot,
+                f"Графіки ({QUEUE}) | {when_word} ({schedule_date:%d.%m.%Y})",
+            )
+        except Exception as e:
+            logging.error("Не вдалося надіслати скріншот графіків: %s", e)
 
-    if cleaned != state.get("notified", []) or changed:
-        state["notified"] = cleaned
-        save_state(state)
-
-
-async def main():
-    if not BOT_TOKEN or not CHAT_ID:
-        raise SystemExit(
-            "Заповни TELEGRAM_BOT_TOKEN і TELEGRAM_CHAT_ID у змінних середовища або .env."
-        )
-
-    if RUN_ONCE:
-        await check_once()
-        return
-
-    telegram_send(
-        "✅ Бот моніторингу графіка запущений.\n"
-        f"Черга: {QUEUE}\n"
-        f"Перевірка: кожні {CHECK_EVERY_SECONDS // 60} хв.\n"
-        "Сповіщення: одразу після виявлення нового майбутнього відключення."
-    )
-    while True:
-        try:
-            await check_once()
-        except Exception:
-            logging.exception("Помилка перевірки")
-        await asyncio.sleep(CHECK_EVERY_SECONDS)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    if SEND_TE
