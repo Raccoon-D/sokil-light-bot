@@ -225,10 +225,10 @@ async def fetch_site_data():
             )
         if not solved:
             logging.warning(
-                "Cloudflare challenge не пройдено автоматично, пробуємо далі..."
+                "Cloudflare challenge не пройдено автоматично, робимо скріншот поточного стану..."
             )
 
-        await page.wait_for_timeout(10000)
+        await page.wait_for_timeout(8000)
 
         for frame in page.frames:
             try:
@@ -273,7 +273,10 @@ async def fetch_site_data():
             except Exception:
                 continue
 
-        await page.screenshot(path=str(SCREENSHOT_FILE), full_page=True)
+        try:
+            await page.screenshot(path=str(SCREENSHOT_FILE), full_page=True)
+        except Exception as e:
+            logging.error(f"Не вдалося зробити скріншот: {e}")
 
     return "\n---\n".join(texts), SCREENSHOT_FILE
 
@@ -322,40 +325,40 @@ def event_key(start, end):
 async def check_once():
     logging.info("Перевіряю офіційний графік для черги %s", QUEUE)
     text, shot_path = await fetch_site_data()
-
-    if not text.strip():
-        raise RuntimeError("Сайт не повернув текст графіка.")
-
-    if (
-        "Триває перевірка безпеки" in text
-        or "Трохи зачекайте" in text
-        or "Cloudflare" in text
-        or "Ray ID:" in text
-        or "Verify you are human" in text
-    ):
-        raise RuntimeError(
-            "Cloudflare Challenge: графік недоступний для бота."
-        )
-
-    events = extract_events(text)
     now = datetime.now(TZ)
     state = load_state()
     changed = False
 
+    is_cf_blocked = (
+        not text.strip()
+        or "Триває перевірка безпеки" in text
+        or "Трохи зачекайте" in text
+        or "Cloudflare" in text
+        or "Ray ID:" in text
+        or "Verify you are human" in text
+    )
+
+    events = [] if is_cf_blocked else extract_events(text)
+
     if shot_path.exists():
         shot_hash = hashlib.md5(shot_path.read_bytes()).hexdigest()
-
-        if shot_hash != state.get("last_shot_hash", ""):
-            caption = f"Скріншот графіка ({QUEUE}) | {TOWN_NAME}, {STREET_NAME} | {now:%Y-%m-%d %H:%M} | Подій: {len(events)}"
+        status_tag = "CF_BLOCK" if is_cf_blocked else f"Подій: {len(events)}"
+        if DEBUG_REPORT or shot_hash != state.get("last_shot_hash", ""):
+            caption = f"Скріншот ({QUEUE}) | {TOWN_NAME}, {STREET_NAME} | {now:%Y-%m-%d %H:%M} | {status_tag}"
             try:
                 telegram_send_photo(shot_path, caption)
                 state["last_shot_hash"] = shot_hash
                 changed = True
-                logging.info("Надіслано новий скріншот графіка.")
+                logging.info("Надіслано скріншот графіка.")
             except Exception as e:
                 logging.error(f"Не вдалося надіслати скріншот: {e}")
-        else:
-            logging.info("Скріншот не змінився, пропускаємо відправку фото.")
+
+    if is_cf_blocked:
+        if changed:
+            save_state(state)
+        raise RuntimeError(
+            "Cloudflare Challenge: графік недоступний для бота."
+        )
 
     if not events:
         logging.info(
@@ -425,4 +428,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
+                
