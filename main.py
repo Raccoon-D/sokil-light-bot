@@ -203,7 +203,8 @@ async def fetch_site_text():
             challenge_type="interstitial",
         )
         if not solved:
-            await page.wait_for_timeout(5000)
+            await page.reload(wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(2000)
             solved = await solve_captcha(
                 page,
                 captcha_type="cloudflare",
@@ -214,7 +215,7 @@ async def fetch_site_text():
                 "Cloudflare challenge не пройдено автоматично, пробуємо далі..."
             )
 
-        await page.wait_for_timeout(15000)
+        await page.wait_for_timeout(12000)
 
         for frame in page.frames:
             try:
