@@ -19,7 +19,6 @@ SOURCE_URL = "https://energy.volyn.ua/spozhyvacham/perervy-u-elektropostachanni/
 QUEUE = "4.1"
 TOWN_NAME = "Сокіл"
 STREET_NAME = "Молодіжна"
-HOUSE_FILTER = "8"
 TZ = ZoneInfo("Europe/Kyiv")
 
 STATE_FILE = Path("state.json")
@@ -336,7 +335,7 @@ async def click_select_button(frame, page):
     return False
 
 
-async def _find_street_input(frame, town_inp):
+async def _find_street_input(frame):
     inputs = frame.locator("input[type='text']:visible, input:not([type]):visible")
     cnt = await inputs.count()
     for idx in range(cnt):
@@ -352,12 +351,7 @@ async def _find_street_input(frame, town_inp):
         except Exception:
             continue
     if cnt >= 2:
-        last_inp = inputs.nth(cnt - 1)
-        try:
-            if ((await last_inp.input_value()) or "").strip().lower() != TOWN_NAME.lower():
-                return last_inp
-        except Exception:
-            return last_inp
+        return inputs.nth(cnt - 1)
     return None
 
 
@@ -375,7 +369,7 @@ async def fill_address_in_frame(frame, page, target_date):
         await _pick_autocomplete_option(frame, page, TOWN_NAME)
         await page.wait_for_timeout(1000)
 
-        street_inp = await _find_street_input(frame, town_inp)
+        street_inp = await _find_street_input(frame)
         if street_inp is not None:
             await _safe_fill_input(street_inp, page, STREET_NAME)
             await page.wait_for_timeout(1500)
@@ -404,17 +398,21 @@ async def _safe_clipped_shot(page, out_path, box):
             and abs(box[k]) != float("inf")
             for k in ("x", "y", "width", "height")
         )
-        and box["width"] >= 50
-        and box["height"] >= 50
+        and box["width"] >= 120
+        and box["height"] >= 120
     ):
         x = max(0.0, float(box["x"]))
         y = max(0.0, float(box["y"]))
-        w = max(50.0, min(1366.0 - x, float(box["width"])))
-        h = max(50.0, min(2200.0, float(box["height"])))
-        await page.evaluate("(posY) => window.scrollTo(0, posY)", max(0.0, y - 30.0))
-        await page.wait_for_timeout(300)
-        await page.screenshot(path=str(out_path), clip={"x": x, "y": y, "width": w, "height": h})
-        return
+        w = max(120.0, min(1366.0 - x, float(box["width"])))
+        h = max(120.0, min(2200.0, float(box["height"])))
+        try:
+            await page.evaluate("(posY) => window.scrollTo(0, posY)", max(0.0, y - 40.0))
+            await page.wait_for_timeout(300)
+            await page.screenshot(path=str(out_path), clip={"x": x, "y": y, "width": w, "height": h})
+            if out_path.exists() and out_path.stat().st_size > 1500:
+                return
+        except Exception:
+            pass
     await page.screenshot(path=str(out_path), full_page=False)
 
 
@@ -636,7 +634,7 @@ async def check_once():
             else "Інтервали у тексті не знайдено."
         )
         msg = (
-            f"⚡️ Черга {QUEUE} ({TOWN_NAME}, {STREET_NAME}, буд. {HOUSE_FILTER}) — {when_word} ({schedule_date:%d.%m.%Y})\n"
+            f"⚡️ Черга {QUEUE} ({TOWN_NAME}, {STREET_NAME}) — {when_word} ({schedule_date:%d.%m.%Y})\n"
             f"Оновлено: {update_stamp}\n\n"
             f"Рядки з пошуку:\n{rows_block}\n\n"
             f"Інтервали:\n{events_block}"
