@@ -199,7 +199,6 @@ async def click_select_button(frame, page):
         except Exception:
             continue
 
-    # Запасний варіант через JS по тексту "Вибрати"
     try:
         clicked_js = await frame.evaluate(
             """() => {
@@ -299,7 +298,6 @@ async def capture_two_screenshots(page):
 
     await page.set_viewport_size({"width": 1366, "height": 1600})
 
-    # 1-й скріншот: блок пошуку адреси та результат під ним
     search_box = await page.evaluate(
         """() => {
             const els = Array.from(document.querySelectorAll('section, article, main, div, form'));
@@ -335,7 +333,6 @@ async def capture_two_screenshots(page):
     else:
         await page.screenshot(path=str(SHOT_SEARCH_FILE), full_page=False)
 
-    # 2-й скріншот: область сітки графіка
     grid_box = await page.evaluate(
         """() => {
             const els = Array.from(document.querySelectorAll('section, article, main, div, img, table'));
@@ -573,20 +570,4 @@ async def check_once():
 
     if search_shot.exists():
         try:
-            telegram_send_photo(
-                search_shot,
-                f"Пошук ({TOWN_NAME}, {STREET_NAME}) | {when_word} ({schedule_date:%d.%m.%Y})\nОновлено: {update_stamp}",
-            )
-        except Exception as e:
-            logging.error("Не вдалося надіслати скріншот пошуку: %s", e)
-
-    if grids_shot.exists():
-        try:
-            telegram_send_photo(
-                grids_shot,
-                f"Графіки ({QUEUE}) | {when_word} ({schedule_date:%d.%m.%Y})",
-            )
-        except Exception as e:
-            logging.error("Не вдалося надіслати скріншот графіків: %s", e)
-
-    if SEND_TE
+            
