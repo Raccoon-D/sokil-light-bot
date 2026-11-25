@@ -148,7 +148,9 @@ def extract_events(page_text, default_date):
             current_date = found_date
 
         low = line.lower()
-        is_target = ("4.1" in line or QUEUE_RE.search(line)) and ("сокіл" in low or "молодіжна" in low or TIME_RE.search(line))
+        is_target = ("4.1" in line or QUEUE_RE.search(line)) and (
+            "сокіл" in low or "молодіжна" in low or TIME_RE.search(line)
+        )
         if not is_target:
             continue
 
@@ -275,6 +277,23 @@ async def _safe_fill_input(inp, page, value):
     return False
 
 
+async def _pick_autocomplete_option(frame, page, text_needle):
+    opts = frame.locator("[role='option'], .autocomplete-item, .dropdown-item, li").get_by_text(
+        text_needle, exact=False
+    )
+    cnt = await opts.count()
+    for i in range(min(cnt, 5)):
+        opt = opts.nth(i)
+        try:
+            if await opt.is_visible():
+                await opt.click(timeout=2000)
+                await page.wait_for_timeout(800)
+                return True
+        except Exception:
+            continue
+    return False
+
+
 async def click_select_button(frame, page):
     candidates = frame.locator(
         "button:has-text('Вибрати'), input[type='submit'][value*='Вибрати'], "
@@ -317,41 +336,51 @@ async def click_select_button(frame, page):
     return False
 
 
+async def _find_street_input(frame, town_inp):
+    inputs = frame.locator("input[type='text']:visible, input:not([type]):visible")
+    cnt = await inputs.count()
+    for idx in range(cnt):
+        cand = inputs.nth(idx)
+        try:
+            ph = ((await cand.get_attribute("placeholder")) or "").lower()
+            nm = ((await cand.get_attribute("name")) or "").lower()
+            val = ((await cand.input_value()) or "").strip().lower()
+            if "вулиц" in ph or "street" in ph or "вулиц" in nm or "street" in nm:
+                return cand
+            if idx > 0 and val != TOWN_NAME.lower():
+                return cand
+        except Exception:
+            continue
+    if cnt >= 2:
+        last_inp = inputs.nth(cnt - 1)
+        try:
+            if ((await last_inp.input_value()) or "").strip().lower() != TOWN_NAME.lower():
+                return last_inp
+        except Exception:
+            return last_inp
+    return None
+
+
 async def fill_address_in_frame(frame, page, target_date):
     await select_today_date(frame, page, target_date)
 
     inputs = frame.locator("input[type='text']:visible, input:not([type]):visible")
-    cnt = await inputs.count()
-    if cnt == 0:
+    if await inputs.count() == 0:
         return False
 
     try:
         town_inp = inputs.nth(0)
         await _safe_fill_input(town_inp, page, TOWN_NAME)
-        await page.wait_for_timeout(1200)
+        await page.wait_for_timeout(1500)
+        await _pick_autocomplete_option(frame, page, TOWN_NAME)
+        await page.wait_for_timeout(1000)
 
-        town_opt = frame.locator("[role='option'], .autocomplete-item, li").get_by_text(TOWN_NAME, exact=False)
-        if await town_opt.count() > 0:
-            try:
-                if await town_opt.first.is_visible():
-                    await town_opt.first.click(timeout=2000)
-                    await page.wait_for_timeout(700)
-            except Exception:
-                pass
-
-        if cnt >= 2:
-            street_inp = inputs.nth(1)
+        street_inp = await _find_street_input(frame, town_inp)
+        if street_inp is not None:
             await _safe_fill_input(street_inp, page, STREET_NAME)
-            await page.wait_for_timeout(1200)
-
-            street_opt = frame.locator("[role='option'], .autocomplete-item, li").get_by_text(STREET_NAME, exact=False)
-            if await street_opt.count() > 0:
-                try:
-                    if await street_opt.first.is_visible():
-                        await street_opt.first.click(timeout=2000)
-                        await page.wait_for_timeout(700)
-                except Exception:
-                    pass
+            await page.wait_for_timeout(1500)
+            await _pick_autocomplete_option(frame, page, STREET_NAME)
+            await page.wait_for_timeout(800)
 
         try:
             await page.keyboard.press("Escape")
@@ -398,7 +427,6 @@ async def capture_two_screenshots(page):
     )
     await page.set_viewport_size({"width": 1366, "height": 2200})
 
-    # 1-й скріншот: сітки графіків ГПВ
     grid_box = await page.evaluate(
         """() => {
             let minY = Infinity, maxBottom = -Infinity, minX = Infinity, maxRight = -Infinity;
@@ -426,7 +454,6 @@ async def capture_two_screenshots(page):
     )
     await _safe_clipped_shot(page, SHOT_GRIDS_FILE, grid_box)
 
-    # 2-й скріншот: таблиця результатів пошуку адреси або форма пошуку без футера
     search_box = await page.evaluate(
         """() => {
             const matched = Array.from(document.querySelectorAll('tr, .alert, .badge, div'))
@@ -434,7 +461,7 @@ async def capture_two_screenshots(page):
                     const r = el.getBoundingClientRect();
                     if (!Number.isFinite(r.x) || !Number.isFinite(r.y) || r.width < 120 || r.height < 18 || r.height > 1400) return false;
                     const t = (el.innerText || '').toLowerCase();
-                    return t.includes('сокіл') && t.includes('молодіжна') && (t.includes('4.1') || t.includes('фільтр:') || el.tagName === 'TR');
+                    return (t.includes('сокіл') || t.includes('молодіжна')) && (t.includes('4.1') || t.includes('фільтр:') || el.tagName === 'TR');
                 });
             let minY = Infinity, maxBottom = -Infinity, minX = Infinity, maxRight = -Infinity;
             for (const el of matched) {
