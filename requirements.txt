@@ -1,4 +1,4 @@
-camoufox[geoip]>=0.4.11
+camoufox
 camoufox-captcha
 python-dotenv
 requests
