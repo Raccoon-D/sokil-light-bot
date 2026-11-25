@@ -22,15 +22,12 @@ STREET_NAME = "Молодіжна"
 TZ = ZoneInfo("Europe/Kyiv")
 
 STATE_FILE = Path("state.json")
-SHOT_GRIDS_FILE = Path("schedule_grids.png")
-SHOT_SEARCH_FILE = Path("schedule_search.png")
 
 PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 RUN_ONCE = os.getenv("RUN_ONCE", "0").strip().lower() in {"1", "true", "yes"}
 CHECK_EVERY_SECONDS = int(os.getenv("CHECK_EVERY_SECONDS", "300"))
-SEND_TEXT_SUMMARY = os.getenv("SEND_TEXT_SUMMARY", "1").strip().lower() in {"1", "true", "yes"}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -68,11 +65,11 @@ def load_state():
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         if isinstance(data, dict):
-            data.setdefault("notified", [])
+            data.setdefault("last_signature", "")
             return data
     except (FileNotFoundError, json.JSONDecodeError):
         pass
-    return {"notified": []}
+    return {"last_signature": ""}
 
 
 def save_state(state):
@@ -100,7 +97,7 @@ def parse_date(text):
 
 def extract_update_stamp(page_text):
     m = re.search(r"Оновлено:\s*([^\n]+)", page_text)
-    return m.group(1).strip() if m else "не вказано"
+    return m.group(1).strip() if m else ""
 
 
 def extract_schedule_date(page_text, fallback_date):
@@ -113,26 +110,44 @@ def extract_schedule_date(page_text, fallback_date):
         if parsed:
             return parsed
     upd = extract_update_stamp(page_text)
-    if upd != "не вказано":
+    if upd:
         parsed_upd = parse_date(upd)
         if parsed_upd:
             return parsed_upd
     return fallback_date
 
 
-def extract_address_rows(page_text):
-    rows = []
+def extract_houses(page_text):
+    houses = []
     seen = set()
     for raw_line in page_text.splitlines():
         line = re.sub(r"\s*\|\s*", " | ", re.sub(r"[ \t]+", " ", raw_line)).strip()
         if not line:
             continue
         low = line.lower()
-        if ("сокіл" in low or "молодіжна" in low) and ("4.1" in line or TIME_RE.search(line)):
-            if line not in seen:
-                seen.add(line)
-                rows.append(line)
-    return rows
+        if ("сокіл" in low and "молодіжна" in low and "4.1" in line) or (
+            "молодіжна" in low and "4.1" in line
+        ):
+            if "|" in line:
+                parts = [p.strip() for p in line.split("|")]
+                for idx, part in enumerate(parts):
+                    if "молодіжна" in part.lower() and idx + 1 < len(parts):
+                        candidate = parts[idx + 1].strip()
+                        if candidate and candidate != "4.1" and candidate not in seen:
+                            seen.add(candidate)
+                            houses.append(candidate)
+            else:
+                m = re.search(
+                    r"Молодіжна\s+(.+?)\s+4\.1\b",
+                    line,
+                    flags=re.IGNORECASE,
+                )
+                if m:
+                    candidate = m.group(1).strip(" ,|")
+                    if candidate and candidate not in seen:
+                        seen.add(candidate)
+                        houses.append(candidate)
+    return houses
 
 
 def extract_events(page_text, default_date):
@@ -179,26 +194,15 @@ def telegram_send(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     r = requests.post(
         url,
-        json={"chat_id": CHAT_ID, "text": message[:4000], "disable_web_page_preview": True},
+        json={
+            "chat_id": CHAT_ID,
+            "text": message[:4000],
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
         timeout=20,
     )
     logging.info("sendMessage status=%s body=%s", r.status_code, r.text[:300])
-    r.raise_for_status()
-    payload = r.json()
-    if not payload.get("ok"):
-        raise RuntimeError(f"Telegram API error: {payload}")
-
-
-def telegram_send_photo(photo_path, caption=""):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-    with open(photo_path, "rb") as f:
-        r = requests.post(
-            url,
-            data={"chat_id": CHAT_ID, "caption": caption[:1000]},
-            files={"photo": f},
-            timeout=30,
-        )
-    logging.info("sendPhoto (%s) status=%s body=%s", photo_path.name, r.status_code, r.text[:300])
     r.raise_for_status()
     payload = r.json()
     if not payload.get("ok"):
@@ -337,7 +341,6 @@ async def _wait_for_filter_result(page, timeout_ms=10000):
 async def fill_address_in_frame(frame, page, target_date):
     await select_today_date(frame, page, target_date)
 
-    # Поле 1: населений пункт; Поле 2: та/або назву вулиці
     town_candidates = frame.locator(
         "input[placeholder*='населен' i]:visible, "
         "input[aria-label*='населен' i]:visible, "
@@ -350,7 +353,11 @@ async def fill_address_in_frame(frame, page, target_date):
     )
     all_inputs = frame.locator("input[type='text']:visible, input:not([type]):visible")
 
-    town_inp = town_candidates.first if await town_candidates.count() > 0 else (all_inputs.nth(0) if await all_inputs.count() > 0 else None)
+    town_inp = (
+        town_candidates.first
+        if await town_candidates.count() > 0
+        else (all_inputs.nth(0) if await all_inputs.count() > 0 else None)
+    )
     street_inp = (
         street_candidates.first
         if await street_candidates.count() > 0
@@ -376,116 +383,6 @@ async def fill_address_in_frame(frame, page, target_date):
     except Exception as e:
         logging.warning("Помилка заповнення форми: %s", e)
     return False
-
-
-async def _safe_clipped_shot(page, out_path, box):
-    if (
-        isinstance(box, dict)
-        and all(k in box for k in ("x", "y", "width", "height"))
-        and all(
-            isinstance(box[k], (int, float))
-            and box[k] == box[k]
-            and abs(box[k]) != float("inf")
-            for k in ("x", "y", "width", "height")
-        )
-        and box["width"] >= 150
-        and box["height"] >= 150
-    ):
-        x = max(0.0, float(box["x"]))
-        y = max(0.0, float(box["y"]))
-        w = max(150.0, min(1366.0 - x, float(box["width"])))
-        h = max(150.0, min(2200.0, float(box["height"])))
-        try:
-            await page.evaluate("(posY) => window.scrollTo(0, posY)", max(0.0, y - 40.0))
-            await page.wait_for_timeout(300)
-            await page.screenshot(path=str(out_path), clip={"x": x, "y": y, "width": w, "height": h})
-            if out_path.exists() and out_path.stat().st_size > 4000:
-                return
-        except Exception:
-            pass
-
-    await page.screenshot(path=str(out_path), full_page=False)
-
-
-async def capture_two_screenshots(page):
-    await page.evaluate(
-        """() => {
-            ['header', 'nav', '.navbar', '.header', 'footer', '.footer', '.modal', '.accessibility-modal', '[class*="cookie" i]', '[id*="cookie" i]']
-                .forEach(sel => document.querySelectorAll(sel).forEach(el => { el.style.display = 'none'; }));
-        }"""
-    )
-
-    # 1-й скріншот: сітка графіків ГПВ
-    await page.set_viewport_size({"width": 1366, "height": 2200})
-    grid_box = await page.evaluate(
-        """() => {
-            let minY = Infinity, maxBottom = -Infinity, minX = Infinity, maxRight = -Infinity;
-            for (const el of document.querySelectorAll('h1, h2, h3, h4, div, p, section, table, img, canvas')) {
-                const txt = el.innerText || '';
-                const r = el.getBoundingClientRect();
-                if (!Number.isFinite(r.x) || !Number.isFinite(r.y) || r.width < 100 || r.height < 20) continue;
-                const isGrid = txt.includes('ГПВ на') || (r.width >= 450 && r.height >= 200);
-                if (!isGrid) continue;
-                minY = Math.min(minY, r.top + window.scrollY);
-                maxBottom = Math.max(maxBottom, r.bottom + window.scrollY);
-                minX = Math.min(minX, r.left + window.scrollX);
-                maxRight = Math.max(maxRight, r.right + window.scrollX);
-            }
-            if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxRight) || !Number.isFinite(maxBottom) || maxBottom <= minY) {
-                return null;
-            }
-            return {
-                x: Math.max(0, minX - 15),
-                y: Math.max(0, minY - 25),
-                width: Math.max(600, (maxRight - minX) + 30),
-                height: Math.max(450, (maxBottom - minY) + 40),
-            };
-        }"""
-    )
-    await _safe_clipped_shot(page, SHOT_GRIDS_FILE, grid_box)
-
-    # 2-й скріншот: блок під кнопкою "Вибрати" (фільтр і таблиця результатів пошуку)
-    await page.set_viewport_size({"width": 1366, "height": 1150})
-    search_y = None
-    for frame in page.frames:
-        try:
-            pos = await frame.evaluate(
-                """() => {
-                    const els = Array.from(document.querySelectorAll('h1, h2, h3, h4, p, div, section, table, button, input'));
-                    const hit = els.find(el => {
-                        const r = el.getBoundingClientRect();
-                        const t = (el.innerText || el.value || '').trim();
-                        return r.height > 15 && r.width > 50 && (
-                            t.includes('Фільтр:') ||
-                            t === 'Вибрати' ||
-                            t.includes('Вибраної адреси у графіках не знайдено')
-                        );
-                    });
-                    if (!hit) return null;
-                    const r = hit.getBoundingClientRect();
-                    let offsetY = 0;
-                    let win = window;
-                    while (win && win !== win.parent) {
-                        const frameEl = win.frameElement;
-                        if (!frameEl) break;
-                        const fr = frameEl.getBoundingClientRect();
-                        offsetY += fr.top + win.parent.scrollY;
-                        win = win.parent;
-                    }
-                    return r.top + window.scrollY + offsetY;
-                }"""
-            )
-            if isinstance(pos, (int, float)) and pos == pos and abs(pos) != float("inf"):
-                search_y = max(0.0, float(pos) - 180.0)
-                break
-        except Exception:
-            continue
-
-    await page.evaluate("(y) => window.scrollTo(0, y)", float(search_y or 900.0))
-    await page.wait_for_timeout(400)
-    await page.screenshot(path=str(SHOT_SEARCH_FILE), full_page=False)
-
-    return SHOT_GRIDS_FILE, SHOT_SEARCH_FILE
 
 
 async def fetch_site_data():
@@ -557,97 +454,57 @@ async def fetch_site_data():
 
         full_text = "\n---\n".join(texts)
         schedule_date = extract_schedule_date(full_text, today)
-        try:
-            grids_shot, search_shot = await capture_two_screenshots(page)
-        except Exception as e:
-            logging.error("Не вдалося зробити скріншоти: %s", e)
-            grids_shot, search_shot = SHOT_GRIDS_FILE, SHOT_SEARCH_FILE
     finally:
         try:
             await browser.__aexit__(None, None, None)
         except Exception:
             pass
 
-    return full_text, grids_shot, search_shot, schedule_date
+    return full_text, schedule_date
+
+
+def format_clean_message(schedule_date, today, events, houses):
+    when_word = day_label(schedule_date, today)
+    intervals_lines = "\n".join(f"• <b>{s:%H:%M} – {e:%H:%M}</b>" for s, e in events)
+    houses_line = f"\n🏠 <b>Будинки:</b> {', '.join(houses[:4])}" if houses else ""
+    return (
+        f"⚡ <b>Графік відключень світла</b>\n"
+        f"📅 <b>Коли:</b> {when_word} ({schedule_date:%d.%m.%Y})\n"
+        f"📍 <b>Адреса:</b> {TOWN_NAME}, вул. {STREET_NAME}\n"
+        f"🔢 <b>Черга:</b> {QUEUE}{houses_line}\n\n"
+        f"🕒 <b>Час відключень:</b>\n{intervals_lines}"
+    )
 
 
 async def check_once():
-    logging.info("Перевіряю офіційний графік для черги %s (chat_id=%s)", QUEUE, CHAT_ID or "EMPTY")
-    text, grids_shot, search_shot, schedule_date = await fetch_site_data()
+    logging.info("Перевіряю графік для %s, %s (черга %s)", TOWN_NAME, STREET_NAME, QUEUE)
+    text, schedule_date = await fetch_site_data()
     now = datetime.now(TZ)
     today = now.date()
-    state = load_state()
-    changed = False
-
-    logging.info(
-        "text_len=%s | schedule_date=%s | grids_exists=%s | search_exists=%s",
-        len(text),
-        schedule_date,
-        grids_shot.exists(),
-        search_shot.exists(),
-    )
 
     if not text.strip() or any(
         k in text for k in ["Триває перевірка безпеки", "Трохи зачекайте", "Cloudflare", "Ray ID:", "Verify you are human"]
     ):
-        raise RuntimeError("Cloudflare Challenge: графік недоступний для бота.")
+        logging.warning("Cloudflare Challenge — пропускаю без відправки в Telegram.")
+        return
 
     events = extract_events(text, schedule_date)
-    addr_rows = extract_address_rows(text)
-    when_word = day_label(schedule_date, today)
-    update_stamp = extract_update_stamp(text)
-    logging.info("events_count=%s | addr_rows=%s | update_stamp=%s", len(events), len(addr_rows), update_stamp)
+    if not events:
+        logging.info("Графіка/інтервалів відключення для адреси/черги не знайдено — в Telegram нічого не пишу.")
+        return
 
-    if grids_shot.exists():
-        try:
-            telegram_send_photo(
-                grids_shot,
-                f"Графіки ГПВ | {when_word} ({schedule_date:%d.%m.%Y})\nОновлено: {update_stamp}",
-            )
-        except Exception as e:
-            logging.error("Помилка фото графіків: %s", e)
+    houses = extract_houses(text)
+    signature = f"{schedule_date.isoformat()}|{QUEUE}|{','.join(f'{s:%H:%M}-{e:%H:%M}' for s, e in events)}"
 
-    if search_shot.exists():
-        try:
-            telegram_send_photo(
-                search_shot,
-                f"Пошук ({TOWN_NAME}, {STREET_NAME}, черга {QUEUE}) | {when_word} ({schedule_date:%d.%m.%Y})",
-            )
-        except Exception as e:
-            logging.error("Помилка фото пошуку: %s", e)
+    state = load_state()
+    if state.get("last_signature") == signature:
+        logging.info("Цей графік уже надісланий — повторно не пишу.")
+        return
 
-    if SEND_TEXT_SUMMARY:
-        rows_block = "\n".join(addr_rows[:12]) if addr_rows else "Рядків за адресою у тексті не знайдено (дивись 2-й скріншот)."
-        events_block = (
-            "\n".join(f"• {s:%H:%M}–{e:%H:%M}" for s, e in events)
-            if events
-            else "Інтервали у тексті не знайдено."
-        )
-        msg = (
-            f"⚡️ Черга {QUEUE} ({TOWN_NAME}, {STREET_NAME}) — {when_word} ({schedule_date:%d.%m.%Y})\n"
-            f"Оновлено: {update_stamp}\n\n"
-            f"Рядки з пошуку:\n{rows_block}\n\n"
-            f"Інтервали:\n{events_block}"
-        )
-        telegram_send(msg)
-
-    notified = set(state.get("notified", []))
-    for start, end in events:
-        if end <= now:
-            continue
-        key = f"{start.isoformat()}|{end.isoformat()}"
-        if key not in notified:
-            telegram_send(
-                f"⚡️ Виявлено майбутнє відключення світла\n\n"
-                f"Черга: {QUEUE}\nКоли: {day_label(start.date(), today)} ({start:%Y-%m-%d})\n"
-                f"Інтервал: {start:%H:%M}–{end:%H:%M}\n\nДжерело: Волиньобленерго"
-            )
-            notified.add(key)
-            changed = True
-
-    if changed:
-        state["notified"] = sorted(notified)
-        save_state(state)
+    msg = format_clean_message(schedule_date, today, events, houses)
+    telegram_send(msg)
+    state["last_signature"] = signature
+    save_state(state)
 
 
 async def main():
@@ -656,7 +513,6 @@ async def main():
     if RUN_ONCE:
         await check_once()
         return
-    telegram_send(f"✅ Бот моніторингу графіка запущений.\nЧерга: {QUEUE}\nПеревірка: кожні {CHECK_EVERY_SECONDS // 60} хв.")
     while True:
         try:
             await check_once()
