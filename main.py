@@ -251,8 +251,9 @@ async def _safe_fill_input(inp, page, value):
         pass
     await page.wait_for_timeout(200)
     try:
+        await inp.click(timeout=2500)
         await inp.fill("", timeout=2500)
-        await inp.type(value, delay=60, timeout=4000)
+        await inp.type(value, delay=50, timeout=4000)
         return True
     except Exception:
         pass
@@ -271,32 +272,8 @@ async def _safe_fill_input(inp, page, value):
             }""",
             [handle, value],
         )
-        await page.wait_for_timeout(400)
+        await page.wait_for_timeout(300)
         return True
-    return False
-
-
-async def _pick_autocomplete_option(frame, page, text_needle):
-    opts = frame.locator("[role='option'], .autocomplete-item, .dropdown-item, li").get_by_text(
-        text_needle, exact=False
-    )
-    cnt = await opts.count()
-    for i in range(min(cnt, 5)):
-        opt = opts.nth(i)
-        try:
-            if await opt.is_visible():
-                await opt.click(timeout=2000)
-                await page.wait_for_timeout(800)
-                return True
-        except Exception:
-            continue
-    try:
-        await page.keyboard.press("ArrowDown")
-        await page.wait_for_timeout(200)
-        await page.keyboard.press("Enter")
-        await page.wait_for_timeout(500)
-    except Exception:
-        pass
     return False
 
 
@@ -310,7 +287,7 @@ async def click_select_button(frame, page):
         try:
             if await btn.is_visible():
                 await btn.scroll_into_view_if_needed(timeout=3000)
-                await page.wait_for_timeout(300)
+                await page.wait_for_timeout(200)
                 await btn.click(timeout=4000)
                 logging.info("Натиснуто кнопку 'Вибрати'.")
                 return True
@@ -340,7 +317,7 @@ async def click_select_button(frame, page):
     return False
 
 
-async def _find_street_input(frame, town_inp):
+async def _find_street_input(frame):
     inputs = frame.locator("input[type='text']:visible, input:not([type]):visible")
     cnt = await inputs.count()
     for idx in range(cnt):
@@ -356,30 +333,22 @@ async def _find_street_input(frame, town_inp):
         except Exception:
             continue
     if cnt >= 2:
-        last_inp = inputs.nth(cnt - 1)
-        try:
-            if ((await last_inp.input_value()) or "").strip().lower() != TOWN_NAME.lower():
-                return last_inp
-        except Exception:
-            return last_inp
+        return inputs.nth(cnt - 1)
     return None
 
 
-async def _wait_for_search_outcome(page, timeout_ms=12000):
+async def _wait_for_result_block(page, timeout_ms=10000):
     deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000.0)
     while asyncio.get_running_loop().time() < deadline:
         for frame in page.frames:
             try:
                 txt = (await frame.evaluate("() => document.body ? document.body.innerText : ''")) or ""
                 low = txt.lower()
-                has_filter = "фільтр:" in low and ("сокіл" in low or "молодіжна" in low)
-                has_rows = "молодіжна" in low and ("4.1" in low or bool(TIME_RE.search(txt)))
-                has_not_found = "вибраної адреси у графіках не знайдено" in low
-                if has_filter or has_rows or has_not_found:
-                    return has_filter or has_rows
+                if "фільтр:" in low or ("молодіжна" in low and ("4.1" in low or bool(TIME_RE.search(txt)))):
+                    return True
             except Exception:
                 continue
-        await page.wait_for_timeout(400)
+        await page.wait_for_timeout(350)
     return False
 
 
@@ -390,38 +359,23 @@ async def fill_address_in_frame(frame, page, target_date):
     if await inputs.count() == 0:
         return False
 
-    for attempt in range(1, 3):
-        try:
-            town_inp = inputs.nth(0)
-            await _safe_fill_input(town_inp, page, TOWN_NAME)
-            await page.wait_for_timeout(1500)
-            await _pick_autocomplete_option(frame, page, TOWN_NAME)
-            await page.wait_for_timeout(1000)
+    try:
+        town_inp = inputs.nth(0)
+        await _safe_fill_input(town_inp, page, TOWN_NAME)
+        await page.wait_for_timeout(400)
 
-            street_inp = await _find_street_input(frame, town_inp)
-            if street_inp is not None:
-                await _safe_fill_input(street_inp, page, STREET_NAME)
-                await page.wait_for_timeout(1500)
-                await _pick_autocomplete_option(frame, page, STREET_NAME)
-                await page.wait_for_timeout(800)
+        street_inp = await _find_street_input(frame)
+        if street_inp is not None:
+            await _safe_fill_input(street_inp, page, STREET_NAME)
+            await page.wait_for_timeout(400)
 
-            try:
-                await page.keyboard.press("Escape")
-                await page.wait_for_timeout(300)
-            except Exception:
-                pass
-
-            if not await click_select_button(frame, page):
-                return False
-
-            matched = await _wait_for_search_outcome(page, timeout_ms=12000)
-            if matched:
-                logging.info("Підтверджено результат пошуку для %s, %s.", TOWN_NAME, STREET_NAME)
-                return True
-            logging.warning("Спроба %s/2: фільтр за адресою ще не відобразився коректно.", attempt)
-        except Exception as e:
-            logging.warning("Помилка заповнення форми (спроба %s/2): %s", attempt, e)
-    return True
+        clicked = await click_select_button(frame, page)
+        if clicked:
+            await _wait_for_result_block(page, timeout_ms=10000)
+        return clicked
+    except Exception as e:
+        logging.warning("Помилка заповнення форми: %s", e)
+    return False
 
 
 async def _safe_clipped_shot(page, out_path, box):
@@ -462,7 +416,7 @@ async def capture_two_screenshots(page):
     )
     await page.set_viewport_size({"width": 1366, "height": 2200})
 
-    # 1-й скріншот: сітка графіків ГПВ (точніший пошук блоку з ГПВ та чергами)
+    # 1-й скріншот: сітка графіків ГПВ
     grid_box = await page.evaluate(
         """() => {
             let best = null;
@@ -488,21 +442,24 @@ async def capture_two_screenshots(page):
     )
     await _safe_clipped_shot(page, SHOT_GRIDS_FILE, grid_box)
 
-    # 2-й скріншот: блок пошуку адреси та таблиці результатів по адресі
+    # 2-й скріншот: блок фільтра/таблиці результатів пошуку адреси
     search_y = None
     for frame in page.frames:
         try:
             pos = await frame.evaluate(
                 """() => {
-                    const priorities = [
+                    const checks = [
                         el => {
                             const t = (el.innerText || '').trim();
                             return t.includes('Фільтр:') && (t.includes('Сокіл') || t.includes('Молодіжна'));
                         },
+                        el => {
+                            const t = (el.innerText || '').trim();
+                            return t.includes('Район') && t.includes('Черга') && t.includes('Молодіжна');
+                        },
                         el => (el.innerText || '').trim().includes('Пошук вашої адреси'),
-                        el => (el.innerText || '').trim().includes('Вибраної адреси у графіках не знайдено'),
                     ];
-                    for (const pred of priorities) {
+                    for (const pred of checks) {
                         const hit = Array.from(document.querySelectorAll('h1, h2, h3, h4, p, div, section, table')).find(el => {
                             const r = el.getBoundingClientRect();
                             return r.height > 15 && r.width > 80 && pred(el);
@@ -525,7 +482,7 @@ async def capture_two_screenshots(page):
                 }"""
             )
             if isinstance(pos, (int, float)) and pos == pos and abs(pos) != float("inf"):
-                search_y = max(0.0, float(pos) - 80.0)
+                search_y = max(0.0, float(pos) - 70.0)
                 break
         except Exception:
             continue
@@ -583,7 +540,7 @@ async def fetch_site_data():
                 except Exception:
                     await page.wait_for_timeout(4000)
 
-        await page.wait_for_timeout(2500)
+        await page.wait_for_timeout(2000)
         await close_accessibility_modal(page)
         for frame in page.frames:
             try:
