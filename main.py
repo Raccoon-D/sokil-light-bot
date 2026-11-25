@@ -40,6 +40,7 @@ logging.basicConfig(
 TIME_RE = re.compile(
     r"(?<!\d)([01]?\d|2[0-3]):([0-5]\d)\s*[-–—]\s*([01]?\d|2[0-3]):([0-5]\d)(?!\d)"
 )
+HM_RE = re.compile(r"\b([01]?\d|2[0-3]):([0-5]\d)\b")
 DATE_DMY_RE = re.compile(r"(?<!\d)(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?!\d)")
 DATE_YMD_RE = re.compile(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)")
 QUEUE_RE = re.compile(r"(?<![\d.])4\.1(?!\d)")
@@ -133,6 +134,97 @@ def extract_address_rows(page_text):
                 seen.add(line)
                 rows.append(line)
     return rows
+
+
+def _merge_half_hour_slots(slots, base_date):
+    if not slots:
+        return []
+    ordered = sorted(set(slots))
+    merged = []
+    cur_start, cur_end = ordered[0]
+    for s_min, e_min in ordered[1:]:
+        if s_min <= cur_end:
+            cur_end = max(cur_end, e_min)
+        else:
+            merged.append((cur_start, cur_end))
+            cur_start, cur_end = s_min, e_min
+    merged.append((cur_start, cur_end))
+
+    result = []
+    for s_min, e_min in merged:
+        s_dt = datetime.combine(base_date, time(0, 0), TZ) + timedelta(minutes=s_min)
+        e_dt = datetime.combine(base_date, time(0, 0), TZ) + timedelta(minutes=e_min)
+        if e_dt <= s_dt:
+            e_dt += timedelta(days=1)
+        result.append((s_dt, e_dt))
+    return result
+
+
+async def extract_grid_events_from_dom(page, schedule_date):
+    slots = []
+    for frame in page.frames:
+        try:
+            raw_items = await frame.evaluate(
+                """() => {
+                    const out = [];
+                    for (const tbl of document.querySelectorAll('table')) {
+                        const trList = Array.from(tbl.querySelectorAll('tr'));
+                        if (trList.length < 3) continue;
+                        const headers = Array.from(trList[0].querySelectorAll('th, td'))
+                            .map(c => (c.innerText || '').replace(/\\s+/g, ' ').trim());
+                        let currentQueue = '';
+                        for (let rIdx = 1; rIdx < trList.length; rIdx++) {
+                            const cells = Array.from(trList[rIdx].querySelectorAll('th, td'));
+                            if (cells.length < 4) continue;
+                            const firstTxt = (cells[0].innerText || '').replace(/\\s+/g, ' ').trim();
+                            if (/^[1-6]$/.test(firstTxt)) {
+                                currentQueue = firstTxt;
+                            }
+                            const secondTxt = (cells[1].innerText || '').replace(/\\s+/g, ' ').trim();
+                            const isTargetRow = (currentQueue === '4' && secondTxt === '1') || trList[rIdx].innerText.includes('4.1');
+                            if (!isTargetRow) continue;
+
+                            for (let cIdx = 2; cIdx < cells.length; cIdx++) {
+                                const cell = cells[cIdx];
+                                const st = window.getComputedStyle(cell);
+                                const bg = st.backgroundColor || '';
+                                const cls = (cell.className || '').toString().toLowerCase();
+                                const m = bg.match(/rgba?\\(\\s*(\\d+)\\s*,\\s*(\\d+)\\s*,\\s*(\\d+)/i);
+                                let isDark = false;
+                                if (m) {
+                                    const r = Number(m[1]), g = Number(m[2]), b = Number(m[3]);
+                                    const brightness = (r + g + b) / 3;
+                                    isDark = brightness < 135 || (b > r + 25 && brightness < 165);
+                                }
+                                if (isDark || cls.includes('off') || cls.includes('out') || cls.includes('active')) {
+                                    out.push({ header: headers[cIdx] || '' });
+                                }
+                            }
+                        }
+                    }
+                    return out;
+                }"""
+            )
+            for item in raw_items or []:
+                hdr = item.get("header", "")
+                m_rng = TIME_RE.search(hdr)
+                if m_rng:
+                    sh, sm, eh, em = map(int, m_rng.groups())
+                    s_min = sh * 60 + sm
+                    e_min = eh * 60 + em
+                    if e_min <= s_min:
+                        e_min += 24 * 60
+                    slots.append((s_min, e_min))
+                    continue
+                m_hm = HM_RE.search(hdr)
+                if m_hm:
+                    sh, sm = map(int, m_hm.groups())
+                    s_min = sh * 60 + sm
+                    slots.append((s_min, s_min + 30))
+        except Exception:
+            continue
+
+    return _merge_half_hour_slots(slots, schedule_date)
 
 
 def extract_events(page_text, default_date):
@@ -388,7 +480,7 @@ async def _safe_clipped_shot(page, out_path, box):
 async def capture_two_screenshots(page):
     await page.evaluate(
         """() => {
-            ['header', 'nav', '.navbar', '.header', '.modal', '.accessibility-modal', '[class*="cookie" i]', '[id*="cookie" i]']
+            ['header', 'nav', '.navbar', '.header', 'footer', '.footer', '.modal', '.accessibility-modal', '[class*="cookie" i]', '[id*="cookie" i]']
                 .forEach(sel => document.querySelectorAll(sel).forEach(el => { el.style.display = 'none'; }));
         }"""
     )
@@ -443,19 +535,19 @@ async def capture_two_screenshots(page):
                     x: Math.max(0, minX - 15),
                     y: Math.max(0, minY - 120),
                     width: Math.max(650, (maxRight - minX) + 30),
-                    height: Math.max(500, (maxBottom - minY) + 160),
+                    height: Math.min(1300, Math.max(500, (maxBottom - minY) + 160)),
                 };
             }
             for (const el of document.querySelectorAll('section, article, main, div, form')) {
                 const txt = el.innerText || '';
                 const r = el.getBoundingClientRect();
-                if (!Number.isFinite(r.x) || !Number.isFinite(r.y) || r.width < 400 || r.height < 160 || r.height > 1800) continue;
-                if (txt.includes('Пошук вашої адреси') || txt.includes('Вибрати')) {
+                if (!Number.isFinite(r.x) || !Number.isFinite(r.y) || r.width < 400 || r.height < 140 || r.height > 900) continue;
+                if (txt.includes('Пошук вашої адреси') && txt.includes('Вибрати')) {
                     return {
                         x: Math.max(0, r.x + window.scrollX - 10),
                         y: Math.max(0, r.y + window.scrollY - 20),
                         width: r.width + 20,
-                        height: r.height + 120,
+                        height: r.height + 160,
                     };
                 }
             }
@@ -485,6 +577,7 @@ async def fetch_site_data():
 
     browser = AsyncCamoufox(**kwargs)
     ctx = await browser.__aenter__()
+    dom_events = []
     try:
         page = await ctx.new_page(viewport={"width": 1366, "height": 1400})
         try:
@@ -536,6 +629,7 @@ async def fetch_site_data():
 
         full_text = "\n---\n".join(texts)
         schedule_date = extract_schedule_date(full_text, today)
+        dom_events = await extract_grid_events_from_dom(page, schedule_date)
         try:
             grids_shot, search_shot = await capture_two_screenshots(page)
         except Exception as e:
@@ -547,12 +641,12 @@ async def fetch_site_data():
         except Exception:
             pass
 
-    return full_text, grids_shot, search_shot, schedule_date
+    return full_text, grids_shot, search_shot, schedule_date, dom_events
 
 
 async def check_once():
     logging.info("Перевіряю офіційний графік для черги %s (chat_id=%s)", QUEUE, CHAT_ID or "EMPTY")
-    text, grids_shot, search_shot, schedule_date = await fetch_site_data()
+    text, grids_shot, search_shot, schedule_date, dom_events = await fetch_site_data()
     now = datetime.now(TZ)
     today = now.date()
     state = load_state()
@@ -571,7 +665,10 @@ async def check_once():
     ):
         raise RuntimeError("Cloudflare Challenge: графік недоступний для бота.")
 
-    events = extract_events(text, schedule_date)
+    text_events = extract_events(text, schedule_date)
+    merged = {(s.isoformat(), e.isoformat()): (s, e) for s, e in (dom_events + text_events)}
+    events = sorted(merged.values(), key=lambda x: x[0])
+
     addr_rows = extract_address_rows(text)
     when_word = day_label(schedule_date, today)
     update_stamp = extract_update_stamp(text)
@@ -600,7 +697,7 @@ async def check_once():
         events_block = (
             "\n".join(f"• {s:%H:%M}–{e:%H:%M}" for s, e in events)
             if events
-            else "Інтервали у тексті не розпізнані."
+            else "Відключень по сітці/тексту не знайдено."
         )
         msg = (
             f"⚡️ Черга {QUEUE} ({TOWN_NAME}, {STREET_NAME}) — {when_word} ({schedule_date:%d.%m.%Y})\n"
