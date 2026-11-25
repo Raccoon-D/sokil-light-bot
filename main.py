@@ -1,4 +1,5 @@
 import asyncio
+import html
 import json
 import logging
 import os
@@ -65,11 +66,12 @@ def load_state():
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         if isinstance(data, dict):
+            data.setdefault("notified", [])
             data.setdefault("last_signature", "")
             return data
     except (FileNotFoundError, json.JSONDecodeError):
         pass
-    return {"last_signature": ""}
+    return {"notified": [], "last_signature": ""}
 
 
 def save_state(state):
@@ -97,7 +99,7 @@ def parse_date(text):
 
 def extract_update_stamp(page_text):
     m = re.search(r"Оновлено:\s*([^\n]+)", page_text)
-    return m.group(1).strip() if m else ""
+    return m.group(1).strip() if m else "не вказано"
 
 
 def extract_schedule_date(page_text, fallback_date):
@@ -110,7 +112,7 @@ def extract_schedule_date(page_text, fallback_date):
         if parsed:
             return parsed
     upd = extract_update_stamp(page_text)
-    if upd:
+    if upd != "не вказано":
         parsed_upd = parse_date(upd)
         if parsed_upd:
             return parsed_upd
@@ -125,9 +127,7 @@ def extract_houses(page_text):
         if not line:
             continue
         low = line.lower()
-        if ("сокіл" in low and "молодіжна" in low and "4.1" in line) or (
-            "молодіжна" in low and "4.1" in line
-        ):
+        if ("сокіл" in low or "молодіжна" in low) and ("4.1" in line or TIME_RE.search(line)):
             if "|" in line:
                 parts = [p.strip() for p in line.split("|")]
                 for idx, part in enumerate(parts):
@@ -136,17 +136,6 @@ def extract_houses(page_text):
                         if candidate and candidate != "4.1" and candidate not in seen:
                             seen.add(candidate)
                             houses.append(candidate)
-            else:
-                m = re.search(
-                    r"Молодіжна\s+(.+?)\s+4\.1\b",
-                    line,
-                    flags=re.IGNORECASE,
-                )
-                if m:
-                    candidate = m.group(1).strip(" ,|")
-                    if candidate and candidate not in seen:
-                        seen.add(candidate)
-                        houses.append(candidate)
     return houses
 
 
@@ -191,15 +180,11 @@ def day_label(target_date, today):
 
 
 def telegram_send(message):
+    safe_msg = html.unescape(message)[:4000]
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     r = requests.post(
         url,
-        json={
-            "chat_id": CHAT_ID,
-            "text": message[:4000],
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
+        json={"chat_id": CHAT_ID, "text": safe_msg, "disable_web_page_preview": True},
         timeout=20,
     )
     logging.info("sendMessage status=%s body=%s", r.status_code, r.text[:300])
@@ -465,14 +450,14 @@ async def fetch_site_data():
 
 def format_clean_message(schedule_date, today, events, houses):
     when_word = day_label(schedule_date, today)
-    intervals_lines = "\n".join(f"• <b>{s:%H:%M} – {e:%H:%M}</b>" for s, e in events)
-    houses_line = f"\n🏠 <b>Будинки:</b> {', '.join(houses[:4])}" if houses else ""
+    intervals_text = "\n".join(f"• {s:%H:%M} – {e:%H:%M}" for s, e in events)
+    houses_line = f"\nБудинки: {', '.join(houses[:4])}" if houses else ""
     return (
-        f"⚡ <b>Графік відключень світла</b>\n"
-        f"📅 <b>Коли:</b> {when_word} ({schedule_date:%d.%m.%Y})\n"
-        f"📍 <b>Адреса:</b> {TOWN_NAME}, вул. {STREET_NAME}\n"
-        f"🔢 <b>Черга:</b> {QUEUE}{houses_line}\n\n"
-        f"🕒 <b>Час відключень:</b>\n{intervals_lines}"
+        f"⚡ Графік відключень світла\n"
+        f"Коли: {when_word} ({schedule_date:%d.%m.%Y})\n"
+        f"Адреса: {TOWN_NAME}, вул. {STREET_NAME}\n"
+        f"Черга: {QUEUE}{houses_line}\n\n"
+        f"Час відключень:\n{intervals_text}"
     )
 
 
