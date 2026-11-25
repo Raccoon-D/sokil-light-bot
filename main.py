@@ -253,7 +253,7 @@ async def _type_like_user(inp, page, value):
     try:
         await inp.click(timeout=3000)
         await inp.fill("")
-        await inp.type(value, delay=70, timeout=5000)
+        await inp.type(value, delay=65, timeout=5000)
         await page.wait_for_timeout(300)
         return True
     except Exception:
@@ -358,6 +358,35 @@ async def fill_address_in_frame(frame, page, target_date):
     return False
 
 
+async def _safe_clipped_shot(page, out_path, box):
+    if (
+        isinstance(box, dict)
+        and all(k in box for k in ("x", "y", "width", "height"))
+        and all(
+            isinstance(box[k], (int, float))
+            and box[k] == box[k]
+            and abs(box[k]) != float("inf")
+            for k in ("x", "y", "width", "height")
+        )
+        and box["width"] >= 150
+        and box["height"] >= 150
+    ):
+        x = max(0.0, float(box["x"]))
+        y = max(0.0, float(box["y"]))
+        w = max(150.0, min(1366.0 - x, float(box["width"])))
+        h = max(150.0, min(2200.0, float(box["height"])))
+        try:
+            await page.evaluate("(posY) => window.scrollTo(0, posY)", max(0.0, y - 40.0))
+            await page.wait_for_timeout(300)
+            await page.screenshot(path=str(out_path), clip={"x": x, "y": y, "width": w, "height": h})
+            if out_path.exists() and out_path.stat().st_size > 4000:
+                return
+        except Exception:
+            pass
+
+    await page.screenshot(path=str(out_path), full_page=False)
+
+
 async def capture_two_screenshots(page):
     await page.evaluate(
         """() => {
@@ -366,83 +395,86 @@ async def capture_two_screenshots(page):
         }"""
     )
 
-    # 1-й скріншот: сітка графіків ГПВ
-    grid_y = None
+    # 1-й скріншот: сітка графіків ГПВ (як було раніше)
+    await page.set_viewport_size({"width": 1366, "height": 2200})
+    grid_box = await page.evaluate(
+        """() => {
+            let minY = Infinity, maxBottom = -Infinity, minX = Infinity, maxRight = -Infinity;
+            for (const el of document.querySelectorAll('h1, h2, h3, h4, div, p, section, table, img, canvas')) {
+                const txt = el.innerText || '';
+                const r = el.getBoundingClientRect();
+                if (!Number.isFinite(r.x) || !Number.isFinite(r.y) || r.width < 100 || r.height < 20) continue;
+                const isGrid = txt.includes('ГПВ на') || (r.width >= 450 && r.height >= 200);
+                if (!isGrid) continue;
+                minY = Math.min(minY, r.top + window.scrollY);
+                maxBottom = Math.max(maxBottom, r.bottom + window.scrollY);
+                minX = Math.min(minX, r.left + window.scrollX);
+                maxRight = Math.max(maxRight, r.right + window.scrollX);
+            }
+            if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxRight) || !Number.isFinite(maxBottom) || maxBottom <= minY) {
+                return null;
+            }
+            return {
+                x: Math.max(0, minX - 15),
+                y: Math.max(0, minY - 25),
+                width: Math.max(600, (maxRight - minX) + 30),
+                height: Math.max(450, (maxBottom - minY) + 40),
+            };
+        }"""
+    )
+    await _safe_clipped_shot(page, SHOT_GRIDS_FILE, grid_box)
+
+    # 2-й скріншот: таблиця / фільтр результатів пошуку по адресі
+    await page.set_viewport_size({"width": 1366, "height": 1150})
+    scrolled_to_table = False
     for frame in page.frames:
         try:
-            pos = await frame.evaluate(
-                """() => {
-                    const els = Array.from(document.querySelectorAll('h1, h2, h3, h4, p, div, section, table'));
-                    const hit = els.find(el => {
-                        const r = el.getBoundingClientRect();
-                        const t = (el.innerText || '').trim();
-                        return r.height > 20 && r.width > 200 && (t.includes('ГПВ на') || (t.includes('00:00') && t.includes('1.1')));
-                    });
-                    if (!hit) return null;
-                    const r = hit.getBoundingClientRect();
-                    let offsetY = 0;
-                    let win = window;
-                    while (win && win !== win.parent) {
-                        const frameEl = win.frameElement;
-                        if (!frameEl) break;
-                        const fr = frameEl.getBoundingClientRect();
-                        offsetY += fr.top + win.parent.scrollY;
-                        win = win.parent;
-                    }
-                    return r.top + window.scrollY + offsetY;
-                }"""
-            )
-            if isinstance(pos, (int, float)) and pos == pos and abs(pos) != float("inf"):
-                grid_y = max(0.0, float(pos) - 40.0)
-                break
-        except Exception:
-            continue
-
-    await page.evaluate("(y) => window.scrollTo(0, y)", float(grid_y or 0.0))
-    await page.wait_for_timeout(350)
-    await page.screenshot(path=str(SHOT_GRIDS_FILE), full_page=False)
-
-    # 2-й скріншот: блок фільтра та результатів пошуку адреси
-    search_y = None
-    for frame in page.frames:
-        try:
-            pos = await frame.evaluate(
+            found = await frame.evaluate(
                 """() => {
                     const checks = [
+                        el => {
+                            const t = (el.innerText || '').trim();
+                            return t.includes('Фільтр:') && (t.includes('Сокіл') || t.includes('Молодіжна'));
+                        },
+                        el => {
+                            const t = (el.innerText || '').trim();
+                            return t.includes('Район') && t.includes('Черга');
+                        },
                         el => (el.innerText || '').includes('Фільтр:'),
                         el => (el.innerText || '').includes('Пошук вашої адреси'),
-                        el => (el.innerText || '').includes('Вибраної адреси у графіках не знайдено'),
                     ];
+                    let target = null;
                     for (const pred of checks) {
-                        const hit = Array.from(document.querySelectorAll('h1, h2, h3, h4, p, div, section, table')).find(el => {
+                        target = Array.from(document.querySelectorAll('h1, h2, h3, h4, p, div, section, table')).find(el => {
                             const r = el.getBoundingClientRect();
                             return r.height > 15 && r.width > 80 && pred(el);
                         });
-                        if (hit) {
-                            const r = hit.getBoundingClientRect();
-                            let offsetY = 0;
-                            let win = window;
-                            while (win && win !== win.parent) {
-                                const frameEl = win.frameElement;
-                                if (!frameEl) break;
-                                const fr = frameEl.getBoundingClientRect();
-                                offsetY += fr.top + win.parent.scrollY;
-                                win = win.parent;
-                            }
-                            return r.top + window.scrollY + offsetY;
-                        }
+                        if (target) break;
                     }
-                    return null;
+                    if (!target) return false;
+                    let parent = target.parentElement;
+                    while (parent) {
+                        const style = window.getComputedStyle(parent);
+                        if ((style.overflowY === 'auto' || style.overflowY === 'scroll') && parent.scrollHeight > parent.clientHeight) {
+                            parent.scrollTop = Math.max(0, target.offsetTop - 40);
+                        }
+                        parent = parent.parentElement;
+                    }
+                    target.scrollIntoView({block: 'start', behavior: 'instant'});
+                    return true;
                 }"""
             )
-            if isinstance(pos, (int, float)) and pos == pos and abs(pos) != float("inf"):
-                search_y = max(0.0, float(pos) - 80.0)
+            if found:
+                scrolled_to_table = True
                 break
         except Exception:
             continue
 
-    await page.evaluate("(y) => window.scrollTo(0, y)", float(search_y or 750.0))
-    await page.wait_for_timeout(350)
+    if scrolled_to_table:
+        await page.evaluate("() => window.scrollBy(0, -60)")
+    else:
+        await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight * 0.65)")
+    await page.wait_for_timeout(400)
     await page.screenshot(path=str(SHOT_SEARCH_FILE), full_page=False)
 
     return SHOT_GRIDS_FILE, SHOT_SEARCH_FILE
@@ -467,7 +499,7 @@ async def fetch_site_data():
     browser = AsyncCamoufox(**kwargs)
     ctx = await browser.__aenter__()
     try:
-        page = await ctx.new_page(viewport={"width": 1366, "height": 1150})
+        page = await ctx.new_page(viewport={"width": 1366, "height": 1400})
         try:
             await page.goto(SOURCE_URL, wait_until="domcontentloaded", timeout=60000)
         except Exception as e:
