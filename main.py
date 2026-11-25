@@ -102,20 +102,26 @@ def parse_date(text):
     return None
 
 
+def extract_update_stamp(page_text):
+    m = re.search(r"Оновлено:\s*([^\n]+)", page_text)
+    return m.group(1).strip() if m else "не вказано"
+
+
 def extract_schedule_date(page_text, fallback_date):
-    m_gpv = re.search(r"ГПВ\s+на\s+(\d{1,2}[./-]\d{1,2}[./-]\d{4}|\d{4}-\d{1,2}-\d{1,2})", page_text)
+    m_gpv = re.search(
+        r"ГПВ\s+на\s+(\d{1,2}[./-]\d{1,2}[./-]\d{4}|\d{4}-\d{1,2}-\d{1,2})",
+        page_text,
+    )
     if m_gpv:
         parsed = parse_date(m_gpv.group(1))
         if parsed:
             return parsed
 
-    lines = [line.strip() for line in page_text.splitlines() if line.strip()]
-    for line in lines[:40]:
-        if "Оновлено:" in line:
-            continue
-        parsed = parse_date(line)
-        if parsed:
-            return parsed
+    upd = extract_update_stamp(page_text)
+    if upd != "не вказано":
+        parsed_upd = parse_date(upd)
+        if parsed_upd:
+            return parsed_upd
 
     return fallback_date
 
@@ -300,7 +306,7 @@ async def fill_address_in_frame(frame, page):
 
 
 async def capture_schedule_screenshot(page):
-    """Робить акуратний кадр саме сітки ГПВ (як на прикладі 5141.jpg) без шапки й модалок."""
+    """Знімає повний блок графіка з датою і обома сітками (00:00-12:00 та 12:00-24:00), як на 5141_2.jpg."""
     await page.evaluate(
         """() => {
             const hideSelectors = [
@@ -317,17 +323,17 @@ async def capture_schedule_screenshot(page):
         }"""
     )
 
-    # Шукаємо елемент, що містить сітку годин / ГПВ
+    # Шукаємо елемент, що містить заголовок ГПВ / дату і обидва інтервали 00:00 та 12:00
     target_box = await page.evaluate(
         """() => {
-            const candidates = Array.from(document.querySelectorAll('section, article, div, table'));
+            const candidates = Array.from(document.querySelectorAll('section, article, div, main'));
             let best = null;
             let bestArea = Infinity;
             for (const el of candidates) {
                 const txt = (el.innerText || '');
                 if (!txt.includes('00:00') || !txt.includes('12:00')) continue;
                 const rect = el.getBoundingClientRect();
-                if (rect.width < 450 || rect.height < 250 || rect.height > 2600) continue;
+                if (rect.width < 500 || rect.height < 450 || rect.height > 2400) continue;
                 const area = rect.width * rect.height;
                 if (area < bestArea) {
                     bestArea = area;
@@ -344,18 +350,21 @@ async def capture_schedule_screenshot(page):
     )
 
     if target_box:
-        await page.set_viewport_size({"width": 1366, "height": min(2400, max(900, int(target_box["height"] + 120)))})
-        await page.evaluate(
-            """(y) => window.scrollTo(0, Math.max(0, y - 40))""",
-            target_box["y"],
-        )
+        # Підхоплюємо трохи вище від верху сітки, щоб у кадр потрапив заголовок з датою і часом формування
+        top_y = max(0.0, float(target_box["y"]) - 95.0)
+        full_h = min(2400.0, float(target_box["height"]) + 115.0)
+        win_w = max(1200, int(float(target_box["width"]) + 60))
+        win_h = min(2600, max(1000, int(full_h + 120)))
+
+        await page.set_viewport_size({"width": win_w, "height": win_h})
+        await page.evaluate("(y) => window.scrollTo(0, y)", top_y)
         await page.wait_for_timeout(400)
 
         clip = {
-            "x": max(0, target_box["x"] - 10),
-            "y": max(0, target_box["y"] - 20),
-            "width": min(1366, target_box["width"] + 20),
-            "height": min(2200, target_box["height"] + 40),
+            "x": max(0.0, float(target_box["x"]) - 15.0),
+            "y": top_y,
+            "width": min(float(win_w), float(target_box["width"]) + 30.0),
+            "height": full_h,
         }
         await page.screenshot(path=str(SCREENSHOT_FILE), clip=clip)
         return
@@ -514,11 +523,6 @@ def event_key(start, end):
     return f"{start.isoformat()}|{end.isoformat()}"
 
 
-def extract_update_stamp(page_text):
-    m = re.search(r"Оновлено:\s*([^\n]+)", page_text)
-    return m.group(1).strip() if m else "не вказано"
-
-
 async def check_once():
     logging.info("Перевіряю офіційний графік для черги %s", QUEUE)
     text, shot_path, schedule_date, grid_events = await fetch_site_data()
@@ -576,7 +580,7 @@ async def check_once():
         else:
             summary_msg = (
                 f"ℹ️ Черга {QUEUE} ({TOWN_NAME}, {STREET_NAME}) — графік на {when_word} ({schedule_date:%d.%m.%Y})\n"
-                f"Майбутніх відключень для {QUEUE} на {when_word} у даних не виявлено (перевір також сітку на фото).\n"
+                f"Майбутніх текстових/сіткових відключень для {QUEUE} на {when_word} не виявлено (перевір сітку на фото).\n"
                 f"Оновлено на сайті: {update_stamp}"
             )
         telegram_send(summary_msg)
