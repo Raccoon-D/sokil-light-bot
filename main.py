@@ -1,5 +1,8 @@
 async def _safe_fill_input(inp, page, value):
-    await inp.scroll_into_view_if_needed(timeout=4000)
+    try:
+        await inp.scroll_into_view_if_needed(timeout=4000)
+    except Exception:
+        pass
     await page.wait_for_timeout(200)
     try:
         await inp.fill("", timeout=2500)
@@ -79,7 +82,12 @@ async def _safe_clipped_shot(page, out_path, box):
     if (
         isinstance(box, dict)
         and all(k in box for k in ("x", "y", "width", "height"))
-        and all(isinstance(box[k], (int, float)) and box[k] == box[k] and abs(box[k]) != float("inf") for k in ("x", "y", "width", "height"))
+        and all(
+            isinstance(box[k], (int, float))
+            and box[k] == box[k]
+            and abs(box[k]) != float("inf")
+            for k in ("x", "y", "width", "height")
+        )
         and box["width"] >= 50
         and box["height"] >= 50
     ):
