@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-SOURCE_URL = "https://energy.volyn.ua/spozhyvacham/perervy-u-elektropostachanni/hrafik-vidkliuchen/pagephp.php"
+SOURCE_URL = "https://energy.volyn.ua/spozhyvacham/perervy-u-elektropostachanni/hrafik-vidkliuchen/#gsc.tab=0"
 QUEUE = "4.1"
 TOWN_NAME = "Сокіл"
 STREET_NAME = "Молодіжна"
@@ -151,41 +151,46 @@ async def fill_address_in_frame(frame, page):
     if inp_count == 0:
         return False
 
-    town_inp = inputs.nth(0)
-    await town_inp.click(timeout=3000)
-    await town_inp.fill(TOWN_NAME)
-    await page.wait_for_timeout(1500)
-
-    town_opt = frame.locator("[role='option'], .autocomplete-item, li").get_by_text(
-        TOWN_NAME, exact=False
-    )
-    if await town_opt.count() > 0:
-        await town_opt.first.click(timeout=3000)
-        await page.wait_for_timeout(1000)
-
-    if inp_count >= 2:
-        street_inp = inputs.nth(1)
-        await street_inp.click(timeout=3000)
-        await street_inp.fill(STREET_NAME)
+    try:
+        town_inp = inputs.nth(0)
+        await town_inp.click(timeout=3000)
+        await town_inp.fill(TOWN_NAME)
         await page.wait_for_timeout(1500)
 
-        street_opt = frame.locator("[role='option'], .autocomplete-item, li").get_by_text(
-            STREET_NAME, exact=False
+        town_opt = frame.locator("[role='option'], .autocomplete-item, li").get_by_text(
+            TOWN_NAME, exact=False
         )
-        if await street_opt.count() > 0:
-            await street_opt.first.click(timeout=3000)
+        if await town_opt.count() > 0:
+            await town_opt.first.click(timeout=3000)
             await page.wait_for_timeout(1000)
 
-    buttons = frame.locator("button:visible, input[type='submit']:visible")
-    if await buttons.count() > 0:
-        await buttons.first.click(timeout=3000)
-        await page.wait_for_timeout(5000)
-        return True
+        if inp_count >= 2:
+            street_inp = inputs.nth(1)
+            await street_inp.click(timeout=3000)
+            await street_inp.fill(STREET_NAME)
+            await page.wait_for_timeout(1500)
+
+            street_opt = frame.locator("[role='option'], .autocomplete-item, li").get_by_text(
+                STREET_NAME, exact=False
+            )
+            if await street_opt.count() > 0:
+                await street_opt.first.click(timeout=3000)
+                await page.wait_for_timeout(1000)
+
+        buttons = frame.locator("button:visible, input[type='submit']:visible")
+        if await buttons.count() > 0:
+            await buttons.first.click(timeout=3000)
+            await page.wait_for_timeout(5000)
+            return True
+    except Exception as e:
+        logging.debug(f"Помилка заповнення фрейму: {e}")
+
     return False
 
 
 async def fetch_site_data():
     texts = []
+
     camoufox_kwargs = {
         "headless": True,
         "geoip": True,
@@ -195,6 +200,7 @@ async def fetch_site_data():
         "config": {"forceScopeAccess": True},
         "disable_coop": True,
     }
+
     proxy_cfg = build_camoufox_proxy(PROXY_URL)
     if proxy_cfg:
         camoufox_kwargs["proxy"] = proxy_cfg
@@ -338,8 +344,85 @@ async def check_once():
 
     if shot_path.exists():
         shot_hash = hashlib.md5(shot_path.read_bytes()).hexdigest()
-        if DEBUG_REPORT or shot_hash != state.get("last_shot_hash", ""):
-            caption = (
-                f"Скріншот графіка ({QUEUE}) | {TOWN_NAME}, {STREET_NAME}\n"
-                f"Час перевірки: {now:%Y-%m-%d %H:%M
-                                                  
+
+        if shot_hash != state.get("last_shot_hash", ""):
+            caption = f"Скріншот графіка ({QUEUE}) | {TOWN_NAME}, {STREET_NAME} | {now:%Y-%m-%d %H:%M} | Подій: {len(events)}"
+            try:
+                telegram_send_photo(shot_path, caption)
+                state["last_shot_hash"] = shot_hash
+                changed = True
+                logging.info("Надіслано новий скріншот графіка.")
+            except Exception as e:
+                logging.error(f"Не вдалося надіслати скріншот: {e}")
+        else:
+            logging.info("Скріншот не змінився, пропускаємо відправку фото.")
+
+    if not events:
+        logging.info(
+            "Майбутніх або активних інтервалів для черги %s не знайдено.",
+            QUEUE,
+        )
+        if changed:
+            save_state(state)
+        return
+
+    notified = set(state.get("notified", []))
+
+    for start, end in events:
+        key = event_key(start, end)
+        if key not in notified:
+            msg = (
+                "⚡️ Виявлено майбутнє відключення світла\n\n"
+                f"Черга: {QUEUE}\n"
+                f"Дата: {start:%Y-%m-%d}\n"
+                f"Інтервал: {start:%H:%M}–{end:%H:%M}\n\n"
+                "Джерело: Волиньобленерго\n"
+                "Фактичний час може відрізнятися від графіка."
+            )
+            telegram_send(msg)
+            notified.add(key)
+            changed = True
+            logging.info("Надіслано сповіщення для події %s", key)
+
+    cutoff = now - timedelta(days=2)
+    cleaned = []
+    for key in notified:
+        try:
+            stamp = datetime.fromisoformat(key.split("|", 1)[0])
+            if stamp >= cutoff:
+                cleaned.append(key)
+        except ValueError:
+            pass
+
+    if cleaned != state.get("notified", []) or changed:
+        state["notified"] = cleaned
+        save_state(state)
+
+
+async def main():
+    if not BOT_TOKEN or not CHAT_ID:
+        raise SystemExit(
+            "Заповни TELEGRAM_BOT_TOKEN і TELEGRAM_CHAT_ID у змінних середовища або .env."
+        )
+
+    if RUN_ONCE:
+        await check_once()
+        return
+
+    telegram_send(
+        "✅ Бот моніторингу графіка запущений.\n"
+        f"Черга: {QUEUE}\n"
+        f"Перевірка: кожні {CHECK_EVERY_SECONDS // 60} хв.\n"
+        "Сповіщення: одразу після виявлення нового майбутнього відключення."
+    )
+    while True:
+        try:
+            await check_once()
+        except Exception:
+            logging.exception("Помилка перевірки")
+        await asyncio.sleep(CHECK_EVERY_SECONDS)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+    
