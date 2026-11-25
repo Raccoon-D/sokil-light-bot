@@ -17,6 +17,8 @@ load_dotenv()
 
 SOURCE_URL = "https://energy.volyn.ua/spozhyvacham/perervy-u-elektropostachanni/hrafik-vidkliuchen/pagephp.php"
 QUEUE = "4.1"
+TOWN_NAME = "Сокіл"
+STREET_NAME = "Молодіжна"
 TZ = ZoneInfo("Europe/Kyiv")
 STATE_FILE = Path("state.json")
 PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
@@ -139,6 +141,45 @@ def extract_events(page_text):
     return sorted(unique.values(), key=lambda x: x[0])
 
 
+async def fill_address_in_frame(frame, page):
+    inputs = frame.locator("input:visible")
+    inp_count = await inputs.count()
+    if inp_count == 0:
+        return False
+
+    town_inp = inputs.nth(0)
+    await town_inp.click(timeout=3000)
+    await town_inp.fill(TOWN_NAME)
+    await page.wait_for_timeout(1500)
+
+    town_opt = frame.locator("[role='option'], .autocomplete-item, li").get_by_text(
+        TOWN_NAME, exact=False
+    )
+    if await town_opt.count() > 0:
+        await town_opt.first.click(timeout=3000)
+        await page.wait_for_timeout(1000)
+
+    if inp_count >= 2:
+        street_inp = inputs.nth(1)
+        await street_inp.click(timeout=3000)
+        await street_inp.fill(STREET_NAME)
+        await page.wait_for_timeout(1500)
+
+        street_opt = frame.locator("[role='option'], .autocomplete-item, li").get_by_text(
+            STREET_NAME, exact=False
+        )
+        if await street_opt.count() > 0:
+            await street_opt.first.click(timeout=3000)
+            await page.wait_for_timeout(1000)
+
+    buttons = frame.locator("button:visible, input[type='submit']:visible")
+    if await buttons.count() > 0:
+        await buttons.first.click(timeout=3000)
+        await page.wait_for_timeout(5000)
+        return True
+    return False
+
+
 async def fetch_site_text():
     texts = []
     camoufox_kwargs = {
@@ -174,6 +215,12 @@ async def fetch_site_text():
             )
 
         await page.wait_for_timeout(15000)
+
+        for frame in page.frames:
+            try:
+                await fill_address_in_frame(frame, page)
+            except Exception:
+                continue
 
         for frame in page.frames:
             try:
