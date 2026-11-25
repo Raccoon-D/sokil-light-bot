@@ -570,4 +570,24 @@ async def check_once():
 
     if search_shot.exists():
         try:
-            
+            telegram_send_photo(
+                search_shot,
+                f"Пошук ({TOWN_NAME}, {STREET_NAME}) | {when_word} ({schedule_date:%d.%m.%Y})\nОновлено: {update_stamp}",
+            )
+        except Exception as e:
+            logging.error("Не вдалося надіслати скріншот пошуку: %s", e)
+
+    if grids_shot.exists():
+        try:
+            telegram_send_photo(
+                grids_shot,
+                f"Графіки ({QUEUE}) | {when_word} ({schedule_date:%d.%m.%Y})",
+            )
+        except Exception as e:
+            logging.error("Не вдалося надіслати скріншот графіків: %s", e)
+
+    if SEND_TEXT_SUMMARY:
+        if events:
+            lines_txt = "\n".join(
+                f"• {day_label(s.date(), today)} ({s:%d.%m}): {s:%H:%M}–{e:%H:%M}"
+     
