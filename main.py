@@ -24,7 +24,7 @@ TZ = ZoneInfo("Europe/Kyiv")
 STATE_FILE = Path("state.json")
 SCREENSHOT_FILE = Path("schedule.png")
 PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
-SEND_ONLY_WHEN_4_1 = os.getenv("SEND_ONLY_WHEN_4_1", "1").strip().lower() in {"1", "true", "yes"}
+SEND_TEXT_SUMMARY = os.getenv("SEND_TEXT_SUMMARY", "1").strip().lower() in {"1", "true", "yes"}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -202,6 +202,37 @@ async def fill_address_in_frame(frame, page):
     return False
 
 
+async def capture_schedule_screenshot(page):
+    # Пробуємо сфокусуватись на блоці графіка/таблиці, щоб скріншот був ближчим до самого графіка
+    target_selectors = [
+        "table",
+        "[class*='schedule' i]",
+        "[class*='graph' i]",
+        "[class*='gpv' i]",
+        "main",
+    ]
+    for sel in target_selectors:
+        try:
+            loc = page.locator(sel)
+            if await loc.count() > 0:
+                box = await loc.first.bounding_box()
+                if box and box["width"] > 300 and box["height"] > 200:
+                    await loc.first.scroll_into_view_if_needed(timeout=3000)
+                    await page.wait_for_timeout(500)
+                    clip = {
+                        "x": max(0, box["x"] - 20),
+                        "y": max(0, box["y"] - 60),
+                        "width": min(1366 - max(0, box["x"] - 20), box["width"] + 40),
+                        "height": min(1400, box["height"] + 120),
+                    }
+                    await page.screenshot(path=str(SCREENSHOT_FILE), clip=clip)
+                    return
+        except Exception:
+            continue
+
+    await page.screenshot(path=str(SCREENSHOT_FILE), full_page=False)
+
+
 async def fetch_site_data():
     texts = []
 
@@ -258,9 +289,7 @@ async def fetch_site_data():
                     await page.wait_for_timeout(4000)
 
         if not solved:
-            logging.warning(
-                "Cloudflare challenge не пройдено після 4 спроб."
-            )
+            logging.warning("Cloudflare challenge не пройдено після 4 спроб.")
 
         await page.wait_for_timeout(3000)
         await close_accessibility_modal(page)
@@ -295,7 +324,7 @@ async def fetch_site_data():
                 continue
 
         try:
-            await page.screenshot(path=str(SCREENSHOT_FILE), full_page=True)
+            await capture_schedule_screenshot(page)
         except Exception as e:
             logging.error("Не вдалося зробити скріншот: %s", e)
 
@@ -343,6 +372,11 @@ def event_key(start, end):
     return f"{start.isoformat()}|{end.isoformat()}"
 
 
+def extract_update_stamp(page_text):
+    m = re.search(r"Оновлено:\s*([^\n]+)", page_text)
+    return m.group(1).strip() if m else "не вказано"
+
+
 async def check_once():
     logging.info("Перевіряю офіційний графік для черги %s", QUEUE)
     text, shot_path = await fetch_site_data()
@@ -365,36 +399,41 @@ async def check_once():
         )
 
     events = extract_events(text)
-    has_4_1_schedule = bool(events) or ("4.1" in text)
+    has_4_1_text = ("4.1" in text) or bool(events)
+    update_stamp = extract_update_stamp(text)
 
     if shot_path.exists():
         shot_hash = hashlib.md5(shot_path.read_bytes()).hexdigest()
-        should_send_photo = (
-            (has_4_1_schedule or not SEND_ONLY_WHEN_4_1)
-            and shot_hash != state.get("last_shot_hash", "")
+        caption = (
+            f"Графік ({QUEUE}) | {TOWN_NAME}, {STREET_NAME}\n"
+            f"Перевірено: {now:%Y-%m-%d %H:%M} | Оновлено на сайті: {update_stamp}"
         )
-        if should_send_photo:
-            caption = f"Графік ({QUEUE}) | {TOWN_NAME}, {STREET_NAME} | {now:%Y-%m-%d %H:%M} | Подій: {len(events)}"
-            try:
-                telegram_send_photo(shot_path, caption)
-                state["last_shot_hash"] = shot_hash
-                changed = True
-                logging.info("Надіслано скріншот графіка для черги %s.", QUEUE)
-            except Exception as e:
-                logging.error(f"Не вдалося надіслати скріншот: {e}")
-        else:
-            logging.info(
-                "Скріншот не відправляємо: немає змін або ще не виявлено графіка 4.1."
-            )
+        try:
+            telegram_send_photo(shot_path, caption)
+            state["last_shot_hash"] = shot_hash
+            changed = True
+            logging.info("Надіслано скріншот графіка.")
+        except Exception as e:
+            logging.error("Не вдалося надіслати скріншот: %s", e)
 
-    if not events:
-        logging.info(
-            "Майбутніх або активних інтервалів для черги %s не знайдено.",
-            QUEUE,
-        )
-        if changed:
-            save_state(state)
-        return
+    if SEND_TEXT_SUMMARY:
+        if events:
+            lines_txt = "\n".join(
+                f"• {s:%Y-%m-%d} | {s:%H:%M}–{e:%H:%M}" for s, e in events
+            )
+            summary_msg = (
+                f"📋 Звіт по черзі {QUEUE} ({TOWN_NAME}, {STREET_NAME})\n"
+                f"Оновлено на сайті: {update_stamp}\n"
+                f"Знайдено інтервалів:\n{lines_txt}"
+            )
+        else:
+            summary_msg = (
+                f"📋 Звіт по черзі {QUEUE} ({TOWN_NAME}, {STREET_NAME})\n"
+                f"Оновлено на сайті: {update_stamp}\n"
+                f"Згадка 4.1 у тексті: {'так' if has_4_1_text else 'ні (графік може бути на сітці/картинці)'}\n"
+                "Майбутніх текстових інтервалів не знайдено."
+            )
+        telegram_send(summary_msg)
 
     notified = set(state.get("notified", []))
 
