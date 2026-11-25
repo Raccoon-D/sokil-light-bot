@@ -30,20 +30,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run bot
-        run: |
-          python - <<'EOF'
-          p = "main.py"
-          lines = open(p, encoding="utf-8").readlines()
-          if len(lines) >= 304:
-              lines[303] = '                f"Інтервал: {start:%H:%M}–{end:%H:%M}\\n\\n"\n'
-          s = "".join(lines)
-          s = s.replace("await page.wait_for_timeout(8000)", "await page.wait_for_timeout(15000)")
-          if "DEBUG_REPORT" not in s:
-              s = s.replace('PROXY_URL = os.getenv("PROXY_URL", "").strip() or None', 'PROXY_URL = os.getenv("PROXY_URL", "").strip() or None\nDEBUG_REPORT = True')
-              s = s.replace("events = extract_events(text)", 'events = extract_events(text)\n    if DEBUG_REPORT:\n        telegram_send("DEBUG 4.1: " + (", ".join(f"{a:%Y-%m-%d %H:%M}-{b:%H:%M}" for a,b in events) or "none") + "\\n" + text[:2200])')
-          open(p, "w", encoding="utf-8").write(s)
-          EOF
-          xvfb-run -a python main.py
+        run: xvfb-run -a python main.py
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -62,3 +49,4 @@ jobs:
               git push
             fi
           fi
+          
