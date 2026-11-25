@@ -32,22 +32,11 @@ jobs:
       - name: Run bot
         run: |
           python - <<'EOF'
-          import re
           p = "main.py"
-          s = open(p, encoding="utf-8").read()
-          clean_msg = (
-              'msg = (\n'
-              '                "⚡️ Виявлено майбутнє відключення світла\\n\\n"\n'
-              '                f"Черга: {QUEUE}\\n"\n'
-              '                f"Дата: {start:%Y-%m-%d}\\n"\n'
-              '                f"Інтервал: {start:%H:%M}–{end:%H:%M}\\n\\n"\n'
-              '                "Джерело: Волиньобленерго\\n"\n'
-              '                "Фактичний час може відрізнятися від графіка."\n'
-              '            )\n'
-              '            telegram_send(msg)'
-          )
-          s = re.sub(r'msg\s*=\s*\([\s\S]*?telegram_send\(msg\)', clean_msg, s, count=1)
-          s = re.sub(r'QUEUE_RE\s*=\s*re\.compile\([^\n]*\)', r'QUEUE_RE = re.compile(r"(?<![\\d.])4\\.1(?!\\d)")', s)
+          lines = open(p, encoding="utf-8").readlines()
+          if len(lines) >= 304:
+              lines[303] = '                f"Інтервал: {start:%H:%M}–{end:%H:%M}\\n\\n"\n'
+          s = "".join(lines)
           s = s.replace("await page.wait_for_timeout(8000)", "await page.wait_for_timeout(15000)")
           if "DEBUG_REPORT" not in s:
               s = s.replace('PROXY_URL = os.getenv("PROXY_URL", "").strip() or None', 'PROXY_URL = os.getenv("PROXY_URL", "").strip() or None\nDEBUG_REPORT = True')
@@ -73,4 +62,3 @@ jobs:
               git push
             fi
           fi
-          
