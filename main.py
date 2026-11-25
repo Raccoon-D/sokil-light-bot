@@ -17,8 +17,9 @@ load_dotenv()
 
 SOURCE_URL = "https://energy.volyn.ua/spozhyvacham/perervy-u-elektropostachanni/hrafik-vidkliuchen/#gsc.tab=0"
 QUEUE = "4.1"
-TOWN_NAME = "СОКІЛ"
+TOWN_NAME = "Сокіл"
 STREET_NAME = "Молодіжна"
+HOUSE_FILTER = "8"
 TZ = ZoneInfo("Europe/Kyiv")
 
 STATE_FILE = Path("state.json")
@@ -40,7 +41,6 @@ logging.basicConfig(
 TIME_RE = re.compile(
     r"(?<!\d)([01]?\d|2[0-3]):([0-5]\d)\s*[-–—]\s*([01]?\d|2[0-3]):([0-5]\d)(?!\d)"
 )
-HM_RE = re.compile(r"\b([01]?\d|2[0-3]):([0-5]\d)\b")
 DATE_DMY_RE = re.compile(r"(?<!\d)(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?!\d)")
 DATE_YMD_RE = re.compile(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)")
 QUEUE_RE = re.compile(r"(?<![\d.])4\.1(?!\d)")
@@ -125,7 +125,7 @@ def extract_address_rows(page_text):
     rows = []
     seen = set()
     for raw_line in page_text.splitlines():
-        line = re.sub(r"[ \t]+", " ", raw_line).strip()
+        line = re.sub(r"\s*\|\s*", " | ", re.sub(r"[ \t]+", " ", raw_line)).strip()
         if not line:
             continue
         low = line.lower()
@@ -134,97 +134,6 @@ def extract_address_rows(page_text):
                 seen.add(line)
                 rows.append(line)
     return rows
-
-
-def _merge_half_hour_slots(slots, base_date):
-    if not slots:
-        return []
-    ordered = sorted(set(slots))
-    merged = []
-    cur_start, cur_end = ordered[0]
-    for s_min, e_min in ordered[1:]:
-        if s_min <= cur_end:
-            cur_end = max(cur_end, e_min)
-        else:
-            merged.append((cur_start, cur_end))
-            cur_start, cur_end = s_min, e_min
-    merged.append((cur_start, cur_end))
-
-    result = []
-    for s_min, e_min in merged:
-        s_dt = datetime.combine(base_date, time(0, 0), TZ) + timedelta(minutes=s_min)
-        e_dt = datetime.combine(base_date, time(0, 0), TZ) + timedelta(minutes=e_min)
-        if e_dt <= s_dt:
-            e_dt += timedelta(days=1)
-        result.append((s_dt, e_dt))
-    return result
-
-
-async def extract_grid_events_from_dom(page, schedule_date):
-    slots = []
-    for frame in page.frames:
-        try:
-            raw_items = await frame.evaluate(
-                """() => {
-                    const out = [];
-                    for (const tbl of document.querySelectorAll('table')) {
-                        const trList = Array.from(tbl.querySelectorAll('tr'));
-                        if (trList.length < 3) continue;
-                        const headers = Array.from(trList[0].querySelectorAll('th, td'))
-                            .map(c => (c.innerText || '').replace(/\\s+/g, ' ').trim());
-                        let currentQueue = '';
-                        for (let rIdx = 1; rIdx < trList.length; rIdx++) {
-                            const cells = Array.from(trList[rIdx].querySelectorAll('th, td'));
-                            if (cells.length < 4) continue;
-                            const firstTxt = (cells[0].innerText || '').replace(/\\s+/g, ' ').trim();
-                            if (/^[1-6]$/.test(firstTxt)) {
-                                currentQueue = firstTxt;
-                            }
-                            const secondTxt = (cells[1].innerText || '').replace(/\\s+/g, ' ').trim();
-                            const isTargetRow = (currentQueue === '4' && secondTxt === '1') || trList[rIdx].innerText.includes('4.1');
-                            if (!isTargetRow) continue;
-
-                            for (let cIdx = 2; cIdx < cells.length; cIdx++) {
-                                const cell = cells[cIdx];
-                                const st = window.getComputedStyle(cell);
-                                const bg = st.backgroundColor || '';
-                                const cls = (cell.className || '').toString().toLowerCase();
-                                const m = bg.match(/rgba?\\(\\s*(\\d+)\\s*,\\s*(\\d+)\\s*,\\s*(\\d+)/i);
-                                let isDark = false;
-                                if (m) {
-                                    const r = Number(m[1]), g = Number(m[2]), b = Number(m[3]);
-                                    const brightness = (r + g + b) / 3;
-                                    isDark = brightness < 135 || (b > r + 25 && brightness < 165);
-                                }
-                                if (isDark || cls.includes('off') || cls.includes('out') || cls.includes('active')) {
-                                    out.push({ header: headers[cIdx] || '' });
-                                }
-                            }
-                        }
-                    }
-                    return out;
-                }"""
-            )
-            for item in raw_items or []:
-                hdr = item.get("header", "")
-                m_rng = TIME_RE.search(hdr)
-                if m_rng:
-                    sh, sm, eh, em = map(int, m_rng.groups())
-                    s_min = sh * 60 + sm
-                    e_min = eh * 60 + em
-                    if e_min <= s_min:
-                        e_min += 24 * 60
-                    slots.append((s_min, e_min))
-                    continue
-                m_hm = HM_RE.search(hdr)
-                if m_hm:
-                    sh, sm = map(int, m_hm.groups())
-                    s_min = sh * 60 + sm
-                    slots.append((s_min, s_min + 30))
-        except Exception:
-            continue
-
-    return _merge_half_hour_slots(slots, schedule_date)
 
 
 def extract_events(page_text, default_date):
@@ -237,10 +146,13 @@ def extract_events(page_text, default_date):
         found_date = parse_date(line)
         if found_date and not TIME_RE.search(line) and "Оновлено:" not in line:
             current_date = found_date
-        parts = [p.strip() for p in re.split(r"\s*\|\s*|\t+", line) if p.strip()]
-        if ("4.1" not in parts) and not QUEUE_RE.search(line):
+
+        low = line.lower()
+        is_target = ("4.1" in line or QUEUE_RE.search(line)) and ("сокіл" in low or "молодіжна" in low or TIME_RE.search(line))
+        if not is_target:
             continue
-        neighbor = " | ".join(lines[max(0, idx - 1) : min(len(lines), idx + 3)])
+
+        neighbor = " | ".join(lines[max(0, idx - 1) : min(len(lines), idx + 2)])
         row_date = parse_date(line) or parse_date(neighbor) or current_date
         for m in TIME_RE.finditer(line + " " + neighbor):
             sh, sm, eh, em = map(int, m.groups())
@@ -308,9 +220,9 @@ async def close_accessibility_modal(page):
 
 async def select_today_date(frame, page, target_date):
     variants = [
+        target_date.strftime("%Y-%m-%d"),
         target_date.strftime("%d.%m.%Y"),
         target_date.strftime("%d-%m-%Y"),
-        target_date.strftime("%Y-%m-%d"),
     ]
     selects = frame.locator("select:visible")
     for i in range(await selects.count()):
@@ -418,7 +330,7 @@ async def fill_address_in_frame(frame, page, target_date):
         await _safe_fill_input(town_inp, page, TOWN_NAME)
         await page.wait_for_timeout(1200)
 
-        town_opt = frame.locator("[role='option'], .autocomplete-item, li").get_by_text("Сокіл", exact=False)
+        town_opt = frame.locator("[role='option'], .autocomplete-item, li").get_by_text(TOWN_NAME, exact=False)
         if await town_opt.count() > 0:
             try:
                 if await town_opt.first.is_visible():
@@ -427,8 +339,8 @@ async def fill_address_in_frame(frame, page, target_date):
             except Exception:
                 pass
 
-        street_inp = inputs.nth(cnt - 1) if cnt >= 2 else town_inp
         if cnt >= 2:
+            street_inp = inputs.nth(1)
             await _safe_fill_input(street_inp, page, STREET_NAME)
             await page.wait_for_timeout(1200)
 
@@ -486,6 +398,7 @@ async def capture_two_screenshots(page):
     )
     await page.set_viewport_size({"width": 1366, "height": 2200})
 
+    # 1-й скріншот: сітки графіків ГПВ
     grid_box = await page.evaluate(
         """() => {
             let minY = Infinity, maxBottom = -Infinity, minX = Infinity, maxRight = -Infinity;
@@ -513,41 +426,42 @@ async def capture_two_screenshots(page):
     )
     await _safe_clipped_shot(page, SHOT_GRIDS_FILE, grid_box)
 
+    # 2-й скріншот: таблиця результатів пошуку адреси або форма пошуку без футера
     search_box = await page.evaluate(
         """() => {
-            const rows = Array.from(document.querySelectorAll('tr'))
-                .filter(tr => {
-                    const t = (tr.innerText || '').toLowerCase();
-                    return t.includes('сокіл') || t.includes('молодіжна');
+            const matched = Array.from(document.querySelectorAll('tr, .alert, .badge, div'))
+                .filter(el => {
+                    const r = el.getBoundingClientRect();
+                    if (!Number.isFinite(r.x) || !Number.isFinite(r.y) || r.width < 120 || r.height < 18 || r.height > 1400) return false;
+                    const t = (el.innerText || '').toLowerCase();
+                    return t.includes('сокіл') && t.includes('молодіжна') && (t.includes('4.1') || t.includes('фільтр:') || el.tagName === 'TR');
                 });
             let minY = Infinity, maxBottom = -Infinity, minX = Infinity, maxRight = -Infinity;
-            for (const rEl of rows) {
-                const r = rEl.getBoundingClientRect();
-                if (Number.isFinite(r.x) && Number.isFinite(r.y) && r.width > 0 && r.height > 0) {
-                    minY = Math.min(minY, r.top + window.scrollY);
-                    maxBottom = Math.max(maxBottom, r.bottom + window.scrollY);
-                    minX = Math.min(minX, r.left + window.scrollX);
-                    maxRight = Math.max(maxRight, r.right + window.scrollX);
-                }
+            for (const el of matched) {
+                const r = el.getBoundingClientRect();
+                minY = Math.min(minY, r.top + window.scrollY);
+                maxBottom = Math.max(maxBottom, r.bottom + window.scrollY);
+                minX = Math.min(minX, r.left + window.scrollX);
+                maxRight = Math.max(maxRight, r.right + window.scrollX);
             }
             if (Number.isFinite(minX) && Number.isFinite(minY) && Number.isFinite(maxRight) && Number.isFinite(maxBottom) && maxBottom > minY) {
                 return {
                     x: Math.max(0, minX - 15),
-                    y: Math.max(0, minY - 120),
-                    width: Math.max(650, (maxRight - minX) + 30),
-                    height: Math.min(1300, Math.max(500, (maxBottom - minY) + 160)),
+                    y: Math.max(0, minY - 90),
+                    width: Math.max(680, (maxRight - minX) + 30),
+                    height: Math.min(1500, Math.max(450, (maxBottom - minY) + 140)),
                 };
             }
             for (const el of document.querySelectorAll('section, article, main, div, form')) {
                 const txt = el.innerText || '';
                 const r = el.getBoundingClientRect();
-                if (!Number.isFinite(r.x) || !Number.isFinite(r.y) || r.width < 400 || r.height < 140 || r.height > 900) continue;
+                if (!Number.isFinite(r.x) || !Number.isFinite(r.y) || r.width < 400 || r.height < 160 || r.height > 900) continue;
                 if (txt.includes('Пошук вашої адреси') && txt.includes('Вибрати')) {
                     return {
                         x: Math.max(0, r.x + window.scrollX - 10),
                         y: Math.max(0, r.y + window.scrollY - 20),
                         width: r.width + 20,
-                        height: r.height + 160,
+                        height: r.height + 240,
                     };
                 }
             }
@@ -577,7 +491,6 @@ async def fetch_site_data():
 
     browser = AsyncCamoufox(**kwargs)
     ctx = await browser.__aenter__()
-    dom_events = []
     try:
         page = await ctx.new_page(viewport={"width": 1366, "height": 1400})
         try:
@@ -617,7 +530,7 @@ async def fetch_site_data():
                 rows_text = await frame.evaluate(
                     """() => {
                         const rows = Array.from(document.querySelectorAll('tr'))
-                            .map(r => Array.from(r.querySelectorAll('th, td')).map(c => c.innerText.replace(/\\s+/g, ' ').trim()).filter(Boolean).join(' | '))
+                            .map(r => Array.from(r.querySelectorAll('th, td')).map(c => (c.innerText || '').replace(/\\s+/g, ' ').trim()).filter(Boolean).join(' | '))
                             .filter(Boolean).join('\\n');
                         return (rows + '\\n' + (document.body ? document.body.innerText : '')).trim();
                     }"""
@@ -629,7 +542,6 @@ async def fetch_site_data():
 
         full_text = "\n---\n".join(texts)
         schedule_date = extract_schedule_date(full_text, today)
-        dom_events = await extract_grid_events_from_dom(page, schedule_date)
         try:
             grids_shot, search_shot = await capture_two_screenshots(page)
         except Exception as e:
@@ -641,12 +553,12 @@ async def fetch_site_data():
         except Exception:
             pass
 
-    return full_text, grids_shot, search_shot, schedule_date, dom_events
+    return full_text, grids_shot, search_shot, schedule_date
 
 
 async def check_once():
     logging.info("Перевіряю офіційний графік для черги %s (chat_id=%s)", QUEUE, CHAT_ID or "EMPTY")
-    text, grids_shot, search_shot, schedule_date, dom_events = await fetch_site_data()
+    text, grids_shot, search_shot, schedule_date = await fetch_site_data()
     now = datetime.now(TZ)
     today = now.date()
     state = load_state()
@@ -665,10 +577,7 @@ async def check_once():
     ):
         raise RuntimeError("Cloudflare Challenge: графік недоступний для бота.")
 
-    text_events = extract_events(text, schedule_date)
-    merged = {(s.isoformat(), e.isoformat()): (s, e) for s, e in (dom_events + text_events)}
-    events = sorted(merged.values(), key=lambda x: x[0])
-
+    events = extract_events(text, schedule_date)
     addr_rows = extract_address_rows(text)
     when_word = day_label(schedule_date, today)
     update_stamp = extract_update_stamp(text)
@@ -693,14 +602,14 @@ async def check_once():
             logging.error("Помилка фото пошуку: %s", e)
 
     if SEND_TEXT_SUMMARY:
-        rows_block = "\n".join(addr_rows[:10]) if addr_rows else "Рядків за адресою у тексті не знайдено (дивись 2-й скріншот)."
+        rows_block = "\n".join(addr_rows[:12]) if addr_rows else "Рядків за адресою у тексті не знайдено (дивись 2-й скріншот)."
         events_block = (
             "\n".join(f"• {s:%H:%M}–{e:%H:%M}" for s, e in events)
             if events
-            else "Відключень по сітці/тексту не знайдено."
+            else "Інтервали у тексті не знайдено."
         )
         msg = (
-            f"⚡️ Черга {QUEUE} ({TOWN_NAME}, {STREET_NAME}) — {when_word} ({schedule_date:%d.%m.%Y})\n"
+            f"⚡️ Черга {QUEUE} ({TOWN_NAME}, {STREET_NAME}, буд. {HOUSE_FILTER}) — {when_word} ({schedule_date:%d.%m.%Y})\n"
             f"Оновлено: {update_stamp}\n\n"
             f"Рядки з пошуку:\n{rows_block}\n\n"
             f"Інтервали:\n{events_block}"
