@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -21,6 +22,7 @@ TOWN_NAME = "Сокіл"
 STREET_NAME = "Молодіжна"
 TZ = ZoneInfo("Europe/Kyiv")
 STATE_FILE = Path("state.json")
+SCREENSHOT_FILE = Path("schedule.png")
 PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
 DEBUG_REPORT = os.getenv("DEBUG_REPORT", "1").strip().lower() in {"1", "true", "yes"}
 
@@ -66,11 +68,13 @@ def build_camoufox_proxy(proxy_url):
 def load_state():
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, dict) and isinstance(data.get("notified"), list):
+        if isinstance(data, dict):
+            data.setdefault("notified", [])
+            data.setdefault("last_shot_hash", "")
             return data
     except (FileNotFoundError, json.JSONDecodeError):
         pass
-    return {"notified": []}
+    return {"notified": [], "last_shot_hash": ""}
 
 
 def save_state(state):
@@ -180,11 +184,13 @@ async def fill_address_in_frame(frame, page):
     return False
 
 
-async def fetch_site_text():
+async def fetch_site_data():
     texts = []
     camoufox_kwargs = {
         "headless": True,
         "geoip": True,
+        "locale": "uk-UA",
+        "os": "windows",
         "i_know_what_im_doing": True,
         "config": {"forceScopeAccess": True},
         "disable_coop": True,
@@ -194,8 +200,9 @@ async def fetch_site_text():
         camoufox_kwargs["proxy"] = proxy_cfg
 
     async with AsyncCamoufox(**camoufox_kwargs) as browser:
-        page = await browser.new_page()
+        page = await browser.new_page(viewport={"width": 1366, "height": 900})
         await page.goto(SOURCE_URL, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(3000)
 
         solved = await solve_captcha(
             page,
@@ -204,7 +211,7 @@ async def fetch_site_text():
         )
         if not solved:
             await page.reload(wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(5000)
             solved = await solve_captcha(
                 page,
                 captcha_type="cloudflare",
@@ -215,7 +222,7 @@ async def fetch_site_text():
                 "Cloudflare challenge не пройдено автоматично, пробуємо далі..."
             )
 
-        await page.wait_for_timeout(12000)
+        await page.wait_for_timeout(10000)
 
         for frame in page.frames:
             try:
@@ -241,26 +248,6 @@ async def fetch_site_text():
 
         for frame in page.frames:
             try:
-                date_picker = frame.get_by_text("Виберіть дату ГПВ", exact=False)
-                if await date_picker.count() > 0:
-                    await date_picker.first.click(timeout=3000)
-                    await page.wait_for_timeout(1500)
-                    for target in (
-                        datetime.now(TZ).strftime("%Y-%m-%d"),
-                        (datetime.now(TZ) + timedelta(days=1)).strftime("%Y-%m-%d"),
-                        datetime.now(TZ).strftime("%d.%m.%Y"),
-                        (datetime.now(TZ) + timedelta(days=1)).strftime("%d.%m.%Y"),
-                    ):
-                        opt = frame.get_by_text(target, exact=False)
-                        if await opt.count() > 0:
-                            await opt.last.click(timeout=3000)
-                            await page.wait_for_timeout(4000)
-                            break
-            except Exception:
-                continue
-
-        for frame in page.frames:
-            try:
                 rows_text = await frame.evaluate(
                     """() => {
                         const rows = Array.from(document.querySelectorAll('tr'));
@@ -280,7 +267,9 @@ async def fetch_site_text():
             except Exception:
                 continue
 
-    return "\n---\n".join(texts)
+        await page.screenshot(path=str(SCREENSHOT_FILE), full_page=True)
+
+    return "\n---\n".join(texts), SCREENSHOT_FILE
 
 
 def telegram_send(message):
@@ -301,13 +290,32 @@ def telegram_send(message):
     return payload
 
 
+def telegram_send_photo(photo_path, caption=""):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    with open(photo_path, "rb") as f:
+        response = requests.post(
+            url,
+            data={
+                "chat_id": CHAT_ID,
+                "caption": caption[:1000],
+            },
+            files={"photo": f},
+            timeout=30,
+        )
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("ok"):
+        raise RuntimeError(f"Telegram API error: {payload}")
+    return payload
+
+
 def event_key(start, end):
     return f"{start.isoformat()}|{end.isoformat()}"
 
 
 async def check_once():
     logging.info("Перевіряю офіційний графік для черги %s", QUEUE)
-    text = await fetch_site_text()
+    text, shot_path = await fetch_site_data()
 
     if not text.strip():
         raise RuntimeError("Сайт не повернув текст графіка.")
@@ -324,79 +332,14 @@ async def check_once():
         )
 
     events = extract_events(text)
-
-    if DEBUG_REPORT:
-        preview = " | ".join(line.strip() for line in text.splitlines() if line.strip())[:2500]
-        events_str = ", ".join(f"{s:%Y-%m-%d %H:%M}-{e:%H:%M}" for s, e in events) or "none"
-        telegram_send(f"DEBUG ({QUEUE}): {events_str}\n\n{preview}")
-
-    if not events:
-        logging.info(
-            "Майбутніх або активних інтервалів для черги %s не знайдено.",
-            QUEUE,
-        )
-        return
-
     now = datetime.now(TZ)
     state = load_state()
-    notified = set(state.get("notified", []))
     changed = False
 
-    for start, end in events:
-        key = event_key(start, end)
-        if key not in notified:
-            msg = (
-                "⚡️ Виявлено майбутнє відключення світла\n\n"
-                f"Черга: {QUEUE}\n"
-                f"Дата: {start:%Y-%m-%d}\n"
-                f"Інтервал: {start:%H:%M}–{end:%H:%M}\n\n"
-                "Джерело: Волиньобленерго\n"
-                "Фактичний час може відрізнятися від графіка."
-            )
-            telegram_send(msg)
-            notified.add(key)
-            changed = True
-            logging.info("Надіслано сповіщення для події %s", key)
-
-    cutoff = now - timedelta(days=2)
-    cleaned = []
-    for key in notified:
-        try:
-            stamp = datetime.fromisoformat(key.split("|", 1)[0])
-            if stamp >= cutoff:
-                cleaned.append(key)
-        except ValueError:
-            pass
-
-    if cleaned != state.get("notified", []) or changed:
-        state["notified"] = cleaned
-        save_state(state)
-
-
-async def main():
-    if not BOT_TOKEN or not CHAT_ID:
-        raise SystemExit(
-            "Заповни TELEGRAM_BOT_TOKEN і TELEGRAM_CHAT_ID у змінних середовища або .env."
-        )
-
-    if RUN_ONCE:
-        await check_once()
-        return
-
-    telegram_send(
-        "✅ Бот моніторингу графіка запущений.\n"
-        f"Черга: {QUEUE}\n"
-        f"Перевірка: кожні {CHECK_EVERY_SECONDS // 60} хв.\n"
-        "Сповіщення: одразу після виявлення нового майбутнього відключення."
-    )
-    while True:
-        try:
-            await check_once()
-        except Exception:
-            logging.exception("Помилка перевірки")
-        await asyncio.sleep(CHECK_EVERY_SECONDS)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-    
+    if shot_path.exists():
+        shot_hash = hashlib.md5(shot_path.read_bytes()).hexdigest()
+        if DEBUG_REPORT or shot_hash != state.get("last_shot_hash", ""):
+            caption = (
+                f"Скріншот графіка ({QUEUE}) | {TOWN_NAME}, {STREET_NAME}\n"
+                f"Час перевірки: {now:%Y-%m-%d %H:%M
+                                                  
