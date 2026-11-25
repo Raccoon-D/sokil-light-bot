@@ -207,29 +207,48 @@ async def fetch_site_data():
 
     async with AsyncCamoufox(**camoufox_kwargs) as browser:
         page = await browser.new_page(viewport={"width": 1366, "height": 900})
-        await page.goto(SOURCE_URL, wait_until="domcontentloaded", timeout=60000)
+        try:
+            await page.goto(SOURCE_URL, wait_until="domcontentloaded", timeout=60000)
+        except Exception as e:
+            logging.warning("Помилка первинного завантаження сторінки: %s", e)
 
         solved = False
         for attempt in range(1, 5):
             await page.wait_for_timeout(3500 if attempt == 1 else 6000)
             logging.info("Спроба %s/4 вирішення Cloudflare...", attempt)
-            solved = await solve_captcha(
-                page,
-                captcha_type="cloudflare",
-                challenge_type="interstitial",
-            )
+            try:
+                solved = await solve_captcha(
+                    page,
+                    captcha_type="cloudflare",
+                    challenge_type="interstitial",
+                )
+            except Exception as e:
+                logging.warning("Помилка solve_captcha на спробі %s/4: %s", attempt, e)
+                solved = False
+
             if solved:
                 break
+
             if attempt < 4:
-                logging.warning("Спроба %s/4 не пройшла, перезавантажуємо сторінку...", attempt)
-                await page.reload(wait_until="domcontentloaded", timeout=60000)
+                logging.warning(
+                    "Спроба %s/4 не пройшла, пробуємо оновити сторінку...", attempt
+                )
+                try:
+                    await page.reload(wait_until="domcontentloaded", timeout=60000)
+                except Exception as e:
+                    logging.warning(
+                        "Пропускаємо помилку reload на спробі %s/4 (%s), чекаємо далі...",
+                        attempt,
+                        e,
+                    )
+                    await page.wait_for_timeout(4000)
 
         if not solved:
             logging.warning(
                 "Cloudflare challenge не пройдено після 4 спроб, робимо фінальний скріншот..."
             )
 
-        await page.wait_for_timeout(8000)
+        await page.wait_for_timeout(5000)
 
         for frame in page.frames:
             try:
@@ -277,7 +296,7 @@ async def fetch_site_data():
         try:
             await page.screenshot(path=str(SCREENSHOT_FILE), full_page=True)
         except Exception as e:
-            logging.error(f"Не вдалося зробити скріншот: {e}")
+            logging.error("Не вдалося зробити скріншот: %s", e)
 
     return "\n---\n".join(texts), SCREENSHOT_FILE
 
@@ -429,4 +448,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
