@@ -244,79 +244,39 @@ async def select_today_date(frame, page, target_date):
     return False
 
 
-async def _set_exact_input_value(inp, page, value):
+async def _fill_single_field(inp, page, value):
     try:
         await inp.scroll_into_view_if_needed(timeout=4000)
     except Exception:
         pass
     await page.wait_for_timeout(150)
 
-    for _ in range(2):
-        try:
-            await inp.click(timeout=3000)
-            await inp.press("Control+A")
-            await inp.press("Backspace")
-            await inp.type(value, delay=65, timeout=5000)
-            await page.wait_for_timeout(200)
-            cur = ((await inp.input_value()) or "").strip()
-            if cur == value:
-                return True
-        except Exception:
-            pass
+    try:
+        await inp.click(timeout=3000)
+        await inp.fill("")
+        await inp.type(value, delay=60, timeout=5000)
+        await page.wait_for_timeout(200)
+        return True
+    except Exception:
+        pass
 
-        handle = await inp.element_handle(timeout=3000)
-        if handle:
-            await page.evaluate(
-                """([el, val]) => {
-                    el.scrollIntoView({block: 'center', inline: 'center'});
-                    el.focus();
-                    el.value = '';
-                    el.dispatchEvent(new Event('input', {bubbles: true}));
-                    el.value = val;
-                    el.dispatchEvent(new Event('input', {bubbles: true}));
-                    el.dispatchEvent(new Event('change', {bubbles: true}));
-                }""",
-                [handle, value],
-            )
-            await page.wait_for_timeout(200)
-            try:
-                cur = ((await inp.input_value()) or "").strip()
-                if cur == value:
-                    return True
-            except Exception:
-                return True
+    handle = await inp.element_handle(timeout=3000)
+    if handle:
+        await page.evaluate(
+            """([el, val]) => {
+                el.scrollIntoView({block: 'center', inline: 'center'});
+                el.focus();
+                el.value = '';
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.value = val;
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+            }""",
+            [handle, value],
+        )
+        await page.wait_for_timeout(200)
+        return True
     return False
-
-
-async def _get_address_inputs(frame):
-    # Шукаємо поля саме форми адреси (поруч із кнопкою "Вибрати"), відсортовані зверху вниз
-    handles = await frame.evaluate_handle(
-        """() => {
-            const btn = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], a')).find(el => {
-                const t = (el.innerText || el.value || '').trim();
-                const r = el.getBoundingClientRect();
-                return t.includes('Вибрати') && r.width > 0 && r.height > 0;
-            });
-            let container = btn ? (btn.closest('form') || btn.closest('section') || btn.parentElement?.parentElement || document.body) : document.body;
-            const isVisible = el => {
-                const r = el.getBoundingClientRect();
-                const s = window.getComputedStyle(el);
-                return r.width > 40 && r.height > 15 && s.display !== 'none' && s.visibility !== 'hidden';
-            };
-            let inputs = Array.from(container.querySelectorAll('input[type="text"], input:not([type])')).filter(isVisible);
-            if (inputs.length < 2) {
-                inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])')).filter(isVisible);
-            }
-            inputs.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
-            return inputs;
-        }"""
-    )
-    arr = await handles.json_value()
-    count = len(arr) if isinstance(arr, list) else 0
-    result = []
-    for idx in range(count):
-        result.append(handles.nth(idx))
-    return result
 
 
 async def click_select_button(frame, page):
@@ -366,7 +326,7 @@ async def _wait_for_filter_result(page, timeout_ms=10000):
             try:
                 txt = (await frame.evaluate("() => document.body ? document.body.innerText : ''")) or ""
                 low = txt.lower()
-                if "фільтр:" in low and ("сокіл" in low or "молодіжна" in low or "не знайдено" in low):
+                if "фільтр:" in low or ("молодіжна" in low and ("4.1" in low or bool(TIME_RE.search(txt)))):
                     return True
             except Exception:
                 continue
@@ -377,27 +337,37 @@ async def _wait_for_filter_result(page, timeout_ms=10000):
 async def fill_address_in_frame(frame, page, target_date):
     await select_today_date(frame, page, target_date)
 
-    addr_inputs = await _get_address_inputs(frame)
-    if not addr_inputs:
+    # Поле 1: населений пункт; Поле 2: та/або назву вулиці
+    town_candidates = frame.locator(
+        "input[placeholder*='населен' i]:visible, "
+        "input[aria-label*='населен' i]:visible, "
+        "input[name*='town' i]:visible, input[name*='city' i]:visible"
+    )
+    street_candidates = frame.locator(
+        "input[placeholder*='вулиц' i]:visible, "
+        "input[aria-label*='вулиц' i]:visible, "
+        "input[name*='street' i]:visible"
+    )
+    all_inputs = frame.locator("input[type='text']:visible, input:not([type]):visible")
+
+    town_inp = town_candidates.first if await town_candidates.count() > 0 else (all_inputs.nth(0) if await all_inputs.count() > 0 else None)
+    street_inp = (
+        street_candidates.first
+        if await street_candidates.count() > 0
+        else (all_inputs.nth(1) if await all_inputs.count() > 1 else None)
+    )
+
+    if town_inp is None and street_inp is None:
         return False
 
     try:
-        town_inp = addr_inputs[0]
-        await _set_exact_input_value(town_inp, page, TOWN_NAME)
-        await page.wait_for_timeout(300)
+        if town_inp is not None:
+            await _fill_single_field(town_inp, page, TOWN_NAME)
+            await page.wait_for_timeout(250)
 
-        if len(addr_inputs) >= 2:
-            street_inp = addr_inputs[1]
-            await _set_exact_input_value(street_inp, page, STREET_NAME)
-            await page.wait_for_timeout(300)
-
-        # Повторно перевіряємо, чи в першому полі лишився саме TOWN_NAME
-        try:
-            town_val = ((await town_inp.input_value()) or "").strip()
-            if town_val != TOWN_NAME:
-                await _set_exact_input_value(town_inp, page, TOWN_NAME)
-        except Exception:
-            pass
+        if street_inp is not None:
+            await _fill_single_field(street_inp, page, STREET_NAME)
+            await page.wait_for_timeout(250)
 
         clicked = await click_select_button(frame, page)
         if clicked:
@@ -474,56 +444,44 @@ async def capture_two_screenshots(page):
     )
     await _safe_clipped_shot(page, SHOT_GRIDS_FILE, grid_box)
 
-    # 2-й скріншот: таблиця / фільтр результатів пошуку по адресі
+    # 2-й скріншот: блок під кнопкою "Вибрати" (фільтр і таблиця результатів пошуку)
     await page.set_viewport_size({"width": 1366, "height": 1150})
-    scrolled_to_table = False
+    search_y = None
     for frame in page.frames:
         try:
-            found = await frame.evaluate(
+            pos = await frame.evaluate(
                 """() => {
-                    const checks = [
-                        el => {
-                            const t = (el.innerText || '').trim();
-                            return t.includes('Фільтр:') && (t.includes('Сокіл') || t.includes('Молодіжна'));
-                        },
-                        el => {
-                            const t = (el.innerText || '').trim();
-                            return t.includes('Район') && t.includes('Черга');
-                        },
-                        el => (el.innerText || '').includes('Фільтр:'),
-                        el => (el.innerText || '').includes('Пошук вашої адреси'),
-                    ];
-                    let target = null;
-                    for (const pred of checks) {
-                        target = Array.from(document.querySelectorAll('h1, h2, h3, h4, p, div, section, table')).find(el => {
-                            const r = el.getBoundingClientRect();
-                            return r.height > 15 && r.width > 80 && pred(el);
-                        });
-                        if (target) break;
+                    const els = Array.from(document.querySelectorAll('h1, h2, h3, h4, p, div, section, table, button, input'));
+                    const hit = els.find(el => {
+                        const r = el.getBoundingClientRect();
+                        const t = (el.innerText || el.value || '').trim();
+                        return r.height > 15 && r.width > 50 && (
+                            t.includes('Фільтр:') ||
+                            t === 'Вибрати' ||
+                            t.includes('Вибраної адреси у графіках не знайдено')
+                        );
+                    });
+                    if (!hit) return null;
+                    const r = hit.getBoundingClientRect();
+                    let offsetY = 0;
+                    let win = window;
+                    while (win && win !== win.parent) {
+                        const frameEl = win.frameElement;
+                        if (!frameEl) break;
+                        const fr = frameEl.getBoundingClientRect();
+                        offsetY += fr.top + win.parent.scrollY;
+                        win = win.parent;
                     }
-                    if (!target) return false;
-                    let parent = target.parentElement;
-                    while (parent) {
-                        const style = window.getComputedStyle(parent);
-                        if ((style.overflowY === 'auto' || style.overflowY === 'scroll') && parent.scrollHeight > parent.clientHeight) {
-                            parent.scrollTop = Math.max(0, target.offsetTop - 40);
-                        }
-                        parent = parent.parentElement;
-                    }
-                    target.scrollIntoView({block: 'start', behavior: 'instant'});
-                    return true;
+                    return r.top + window.scrollY + offsetY;
                 }"""
             )
-            if found:
-                scrolled_to_table = True
+            if isinstance(pos, (int, float)) and pos == pos and abs(pos) != float("inf"):
+                search_y = max(0.0, float(pos) - 180.0)
                 break
         except Exception:
             continue
 
-    if scrolled_to_table:
-        await page.evaluate("() => window.scrollBy(0, -60)")
-    else:
-        await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight * 0.65)")
+    await page.evaluate("(y) => window.scrollTo(0, y)", float(search_y or 900.0))
     await page.wait_for_timeout(400)
     await page.screenshot(path=str(SHOT_SEARCH_FILE), full_page=False)
 
