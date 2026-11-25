@@ -24,7 +24,7 @@ TZ = ZoneInfo("Europe/Kyiv")
 STATE_FILE = Path("state.json")
 SCREENSHOT_FILE = Path("schedule.png")
 PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
-DEBUG_REPORT = os.getenv("DEBUG_REPORT", "1").strip().lower() in {"1", "true", "yes"}
+SEND_ONLY_WHEN_4_1 = os.getenv("SEND_ONLY_WHEN_4_1", "1").strip().lower() in {"1", "true", "yes"}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -145,6 +145,20 @@ def extract_events(page_text):
     return sorted(unique.values(), key=lambda x: x[0])
 
 
+async def close_accessibility_modal(page):
+    for frame in page.frames:
+        try:
+            close_btn = frame.locator(
+                "button:has-text('Закрити'), button[aria-label*='Закрити' i], button[aria-label*='Close' i]"
+            )
+            if await close_btn.count() > 0 and await close_btn.first.is_visible():
+                await close_btn.first.click(timeout=3000)
+                await page.wait_for_timeout(800)
+                return
+        except Exception:
+            continue
+
+
 async def fill_address_in_frame(frame, page):
     inputs = frame.locator("input:visible")
     inp_count = await inputs.count()
@@ -177,10 +191,10 @@ async def fill_address_in_frame(frame, page):
                 await street_opt.first.click(timeout=3000)
                 await page.wait_for_timeout(1000)
 
-        buttons = frame.locator("button:visible, input[type='submit']:visible")
-        if await buttons.count() > 0:
-            await buttons.first.click(timeout=3000)
-            await page.wait_for_timeout(5000)
+        find_btn = frame.locator("button:has-text('Знайти'), input[type='submit'][value*='Знайти']")
+        if await find_btn.count() > 0 and await find_btn.first.is_visible():
+            await find_btn.first.click(timeout=3000)
+            await page.wait_for_timeout(4000)
             return True
     except Exception as e:
         logging.debug(f"Помилка заповнення фрейму: {e}")
@@ -245,10 +259,11 @@ async def fetch_site_data():
 
         if not solved:
             logging.warning(
-                "Cloudflare challenge не пройдено після 4 спроб, робимо фінальний скріншот..."
+                "Cloudflare challenge не пройдено після 4 спроб."
             )
 
-        await page.wait_for_timeout(5000)
+        await page.wait_for_timeout(3000)
+        await close_accessibility_modal(page)
 
         for frame in page.frames:
             try:
@@ -256,21 +271,7 @@ async def fetch_site_data():
             except Exception:
                 continue
 
-        for frame in page.frames:
-            try:
-                selects = frame.locator("select")
-                count = await selects.count()
-                for i in range(count):
-                    sel = selects.nth(i)
-                    options = sel.locator("option")
-                    opt_count = await options.count()
-                    if opt_count > 1:
-                        val = await options.nth(opt_count - 1).get_attribute("value")
-                        if val:
-                            await sel.select_option(val)
-                            await page.wait_for_timeout(3000)
-            except Exception:
-                continue
+        await close_accessibility_modal(page)
 
         for frame in page.frames:
             try:
@@ -358,27 +359,33 @@ async def check_once():
         or "Verify you are human" in text
     )
 
-    events = [] if is_cf_blocked else extract_events(text)
+    if is_cf_blocked:
+        raise RuntimeError(
+            "Cloudflare Challenge: графік недоступний для бота."
+        )
+
+    events = extract_events(text)
+    has_4_1_schedule = bool(events) or ("4.1" in text)
 
     if shot_path.exists():
         shot_hash = hashlib.md5(shot_path.read_bytes()).hexdigest()
-        status_tag = "CF_BLOCK" if is_cf_blocked else f"Подій: {len(events)}"
-        if DEBUG_REPORT or shot_hash != state.get("last_shot_hash", ""):
-            caption = f"Скріншот ({QUEUE}) | {TOWN_NAME}, {STREET_NAME} | {now:%Y-%m-%d %H:%M} | {status_tag}"
+        should_send_photo = (
+            (has_4_1_schedule or not SEND_ONLY_WHEN_4_1)
+            and shot_hash != state.get("last_shot_hash", "")
+        )
+        if should_send_photo:
+            caption = f"Графік ({QUEUE}) | {TOWN_NAME}, {STREET_NAME} | {now:%Y-%m-%d %H:%M} | Подій: {len(events)}"
             try:
                 telegram_send_photo(shot_path, caption)
                 state["last_shot_hash"] = shot_hash
                 changed = True
-                logging.info("Надіслано скріншот графіка.")
+                logging.info("Надіслано скріншот графіка для черги %s.", QUEUE)
             except Exception as e:
                 logging.error(f"Не вдалося надіслати скріншот: {e}")
-
-    if is_cf_blocked:
-        if changed:
-            save_state(state)
-        raise RuntimeError(
-            "Cloudflare Challenge: графік недоступний для бота."
-        )
+        else:
+            logging.info(
+                "Скріншот не відправляємо: немає змін або ще не виявлено графіка 4.1."
+            )
 
     if not events:
         logging.info(
