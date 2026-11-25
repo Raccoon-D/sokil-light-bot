@@ -37,7 +37,7 @@ TIME_RE = re.compile(
 )
 DATE_DMY_RE = re.compile(r"(?<!\d)(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?!\d)")
 DATE_YMD_RE = re.compile(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)")
-QUEUE_STRICT_RE = re.compile(r"(?<![\d.])4\.1(?!\d)")
+QUEUE_RE = re.compile(r"(?<![\d.])4\.1(?!\d)")
 
 
 def build_camoufox_proxy(proxy_url):
@@ -110,7 +110,7 @@ def extract_events(page_text):
             current_date = found_date
 
         parts = [p.strip() for p in re.split(r"\s*\|\s*|\t+", line) if p.strip()]
-        has_queue = ("4.1" in parts) or bool(QUEUE_STRICT_RE.search(line))
+        has_queue = ("4.1" in parts) or bool(QUEUE_RE.search(line))
         if not has_queue:
             continue
 
@@ -301,5 +301,54 @@ async def check_once():
                 "⚡️ Виявлено майбутнє відключення світла\n\n"
                 f"Черга: {QUEUE}\n"
                 f"Дата: {start:%Y-%m-%d}\n"
-                f"Інтервал: {start:%H:%M}–{end
-                                           
+                f"Інтервал: {start:%H:%M}–{end:%H:%M}\n\n"
+                "Джерело: Волиньобленерго\n"
+                "Фактичний час може відрізнятися від графіка."
+            )
+            telegram_send(msg)
+            notified.add(key)
+            changed = True
+            logging.info("Надіслано сповіщення для події %s", key)
+
+    cutoff = now - timedelta(days=2)
+    cleaned = []
+    for key in notified:
+        try:
+            stamp = datetime.fromisoformat(key.split("|", 1)[0])
+            if stamp >= cutoff:
+                cleaned.append(key)
+        except ValueError:
+            pass
+
+    if cleaned != state.get("notified", []) or changed:
+        state["notified"] = cleaned
+        save_state(state)
+
+
+async def main():
+    if not BOT_TOKEN or not CHAT_ID:
+        raise SystemExit(
+            "Заповни TELEGRAM_BOT_TOKEN і TELEGRAM_CHAT_ID у змінних середовища або .env."
+        )
+
+    if RUN_ONCE:
+        await check_once()
+        return
+
+    telegram_send(
+        "✅ Бот моніторингу графіка запущений.\n"
+        f"Черга: {QUEUE}\n"
+        f"Перевірка: кожні {CHECK_EVERY_SECONDS // 60} хв.\n"
+        "Сповіщення: одразу після виявлення нового майбутнього відключення."
+    )
+    while True:
+        try:
+            await check_once()
+        except Exception:
+            logging.exception("Помилка перевірки")
+        await asyncio.sleep(CHECK_EVERY_SECONDS)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+    
