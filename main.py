@@ -13,7 +13,6 @@ import requests
 from camoufox import AsyncCamoufox
 from camoufox_captcha import solve_captcha
 from dotenv import load_dotenv
-from PIL import Image
 
 load_dotenv()
 
@@ -127,128 +126,6 @@ def extract_schedule_date(page_text, fallback_date):
     return fallback_date
 
 
-def parse_gpv_image_4_1(image_path, schedule_date):
-    """
-    Розпізнає темні клітинки відключень для черги 4.1 напряму з картинки графіка ГПВ
-    (2 сітки: 00:00-12:00 та 12:00-24:00, у кожній 12 рядків підчерг 1.1..6.2 і 24 слоти по 30 хв).
-    """
-    if not Path(image_path).exists():
-        return []
-
-    img = Image.open(image_path).convert("RGB")
-    w, h = img.size
-    if w < 500 or h < 450:
-        return []
-
-    px = img.load()
-
-    def is_grid_cell_color(r, g, b):
-        # Світло-сіра клітинка (~175..215) або темно-сіра клітинка відключення (~70..130)
-        if max(r, g, b) - min(r, g, b) > 35:
-            return False
-        lum = (r + g + b) / 3.0
-        return 60 <= lum <= 220
-
-    # Знаходимо горизонтальний діапазон 24 півгодинних колонок (вони займають праві ~88% таблиці)
-    col_scores = []
-    for x in range(w):
-        cnt = 0
-        for y in range(int(h * 0.12), int(h * 0.96), 3):
-            if is_grid_cell_color(*px[x, y]):
-                cnt += 1
-        col_scores.append(cnt)
-
-    max_col = max(col_scores) if col_scores else 0
-    if max_col < 20:
-        return []
-
-    grid_xs = [x for x, c in enumerate(col_scores) if c > max_col * 0.45]
-    if not grid_xs:
-        return []
-    full_left, full_right = min(grid_xs), max(grid_xs)
-    # Перші 2 вузькі колонки — "Черга" і "Підчерга" (~11.5% ширини сітки), далі 24 півгодинні слоти
-    slots_left = full_left + (full_right - full_left) * 0.116
-    slots_right = full_right
-    slot_w = (slots_right - slots_left) / 24.0
-    if slot_w < 8:
-        return []
-
-    # Знаходимо вертикальні межі двох сіток (верхня 00:00-12:00 і нижня 12:00-24:00)
-    row_scores = []
-    sample_xs = [int(slots_left + (i + 0.5) * slot_w) for i in range(24)]
-    for y in range(h):
-        cnt = sum(1 for sx in sample_xs if 0 <= sx < w and is_grid_cell_color(*px[sx, y]))
-        row_scores.append(cnt)
-
-    # Групуємо суцільні горизонтальні смуги, де багато клітинок сітки
-    bands = []
-    in_band = False
-    start_y = 0
-    for y, c in enumerate(row_scores):
-        if c >= 18 and not in_band:
-            in_band = True
-            start_y = y
-        elif c < 18 and in_band:
-            in_band = False
-            if y - start_y > h * 0.18:
-                bands.append((start_y, y - 1))
-    if in_band and h - start_y > h * 0.18:
-        bands.append((start_y, h - 1))
-
-    if len(bands) < 2:
-        return []
-
-    # Беремо 2 найбільші смуги (00:00-12:00 та 12:00-24:00) зверху вниз
-    bands = sorted(bands, key=lambda b: b[1] - b[0], reverse=True)[:2]
-    bands.sort(key=lambda b: b[0])
-
-    off_slots = [False] * 48  # 48 півгодинних інтервалів за добу
-
-    for half_idx, (top_y, bot_y) in enumerate(bands):
-        # Верхній рядок смуги — темна шапка з годинами (~1/13 висоти), під нею 12 рядків підчерг (1.1..6.2)
-        band_h = bot_y - top_y
-        header_h = band_h / 13.0
-        rows_top = top_y + header_h
-        row_h = (bot_y - rows_top) / 12.0
-
-        # Черга 4.1 — це 7-й рядок серед 12 підчерг (індекс 6: 1.1=0, 1.2=1, 2.1=2, 2.2=3, 3.1=4, 3.2=5, 4.1=6)
-        cy = int(rows_top + (6 + 0.5) * row_h)
-        if not (0 <= cy < h):
-            continue
-
-        for s_idx in range(24):
-            cx = int(slots_left + (s_idx + 0.5) * slot_w)
-            if not (0 <= cx < w):
-                continue
-            r, g, b = px[cx, cy]
-            lum = (r + g + b) / 3.0
-            # Темно-сіра зафарбована клітинка відключення має яскравість < 135 (світла ~185-205)
-            if lum < 138 and (max(r, g, b) - min(r, g, b) < 35):
-                off_slots[half_idx * 24 + s_idx] = True
-
-    # Збираємо сусідні півгодинні слоти у безперервні інтервали
-    intervals = []
-    i = 0
-    while i < 48:
-        if off_slots[i]:
-            j = i
-            while j < 48 and off_slots[j]:
-                j += 1
-            sh, sm = divmod(i * 30, 60)
-            eh, em = divmod(j * 30, 60)
-            start_dt = datetime.combine(schedule_date, time(sh, sm), TZ)
-            if eh == 24:
-                end_dt = datetime.combine(schedule_date + timedelta(days=1), time(0, 0), TZ)
-            else:
-                end_dt = datetime.combine(schedule_date, time(eh, em), TZ)
-            intervals.append((start_dt, end_dt))
-            i = j
-        else:
-            i += 1
-
-    return intervals
-
-
 def extract_events(page_text, default_date):
     lines = [re.sub(r"[ \t]+", " ", line).strip() for line in page_text.splitlines()]
     lines = [line for line in lines if line]
@@ -285,6 +162,84 @@ def extract_events(page_text, default_date):
 
     unique = {}
     for start, end in events:
+        unique[(start.isoformat(), end.isoformat())] = (start, end)
+    return sorted(unique.values(), key=lambda x: x[0])
+
+
+async def extract_grid_events_from_dom(page, schedule_date):
+    now = datetime.now(TZ)
+    grid_events = []
+
+    for frame in page.frames:
+        try:
+            raw_slots = await frame.evaluate(
+                """() => {
+                    const out = [];
+                    const tables = Array.from(document.querySelectorAll('table'));
+                    for (const tbl of tables) {
+                        const headers = Array.from(tbl.querySelectorAll('thead tr th, tr:first-child th, tr:first-child td'))
+                            .map(el => el.innerText.replace(/\\s+/g, ' ').trim());
+                        const rows = Array.from(tbl.querySelectorAll('tbody tr, tr'));
+                        let activeQueue = '';
+                        for (const tr of rows) {
+                            const cells = Array.from(tr.querySelectorAll('th, td'));
+                            if (!cells.length) continue;
+                            const firstText = cells[0].innerText.replace(/\\s+/g, ' ').trim();
+                            if (/^[1-6]$/.test(firstText)) {
+                                activeQueue = firstText;
+                            }
+                            const secondText = cells.length > 1 ? cells[1].innerText.replace(/\\s+/g, ' ').trim() : '';
+                            const rowLabel = `${activeQueue}.${secondText}`;
+                            if (activeQueue === '4' && (secondText === '1' || rowLabel.includes('4.1'))) {
+                                cells.forEach((cell, idx) => {
+                                    const style = window.getComputedStyle(cell);
+                                    const cls = (cell.className || '').toString().toLowerCase();
+                                    const bg = style.backgroundColor || '';
+                                    const dataAttr = JSON.stringify(cell.dataset || {}).toLowerCase();
+                                    const isOff = (
+                                        cls.includes('off') ||
+                                        cls.includes('out') ||
+                                        cls.includes('disable') ||
+                                        cls.includes('active') ||
+                                        cls.includes('dark') ||
+                                        dataAttr.includes('off') ||
+                                        dataAttr.includes('1') ||
+                                        /rgb\\((\\d+),\\s*(\\d+),\\s*(\\d+)\\)/.test(bg) && (() => {
+                                            const m = bg.match(/rgb\\((\\d+),\\s*(\\d+),\\s*(\\d+)\\)/);
+                                            const r = Number(m[1]), g = Number(m[2]), b = Number(m[3]);
+                                            return (r + g + b) < 420 && Math.max(r, g, b) - Math.min(r, g, b) < 45;
+                                        })()
+                                    );
+                                    if (isOff && idx >= 2) {
+                                        out.push({
+                                            idx,
+                                            header: headers[idx] || '',
+                                            text: cell.innerText.trim(),
+                                        });
+                                    }
+                                });
+                            }
+                        }
+                    }
+                    return out;
+                }"""
+            )
+            for item in raw_slots or []:
+                hdr = item.get("header", "")
+                m = TIME_RE.search(hdr)
+                if m:
+                    sh, sm, eh, em = map(int, m.groups())
+                    start = datetime.combine(schedule_date, time(sh, sm), TZ)
+                    end = datetime.combine(schedule_date, time(eh, em), TZ)
+                    if end <= start:
+                        end += timedelta(days=1)
+                    if end > now:
+                        grid_events.append((start, end))
+        except Exception:
+            continue
+
+    unique = {}
+    for start, end in grid_events:
         unique[(start.isoformat(), end.isoformat())] = (start, end)
     return sorted(unique.values(), key=lambda x: x[0])
 
@@ -347,7 +302,6 @@ async def fill_address_in_frame(frame, page):
 
 
 async def capture_schedule_screenshot(page):
-    """Знімає саме зображення графіка ГПВ (як на 5141_3.jpg), без обрізки верху і без форми пошуку внизу."""
     await page.evaluate(
         """() => {
             const hideSelectors = [
@@ -362,7 +316,6 @@ async def capture_schedule_screenshot(page):
         }"""
     )
 
-    # Шукаємо найбільший <img> у основній частині сторінки — це і є зображення графіка ГПВ
     best_idx = await page.evaluate(
         """() => {
             const imgs = Array.from(document.querySelectorAll('img'));
@@ -486,13 +439,14 @@ async def fetch_site_data():
 
         full_text = "\n---\n".join(texts)
         schedule_date = extract_schedule_date(full_text, datetime.now(TZ).date())
+        dom_events = await extract_grid_events_from_dom(page, schedule_date)
 
         try:
             await capture_schedule_screenshot(page)
         except Exception as e:
             logging.error("Не вдалося зробити скріншот: %s", e)
 
-    return full_text, SCREENSHOT_FILE, schedule_date
+    return full_text, SCREENSHOT_FILE, schedule_date, dom_events
 
 
 def day_label(target_date, today):
@@ -546,7 +500,7 @@ def event_key(start, end):
 
 async def check_once():
     logging.info("Перевіряю офіційний графік для черги %s", QUEUE)
-    text, shot_path, schedule_date = await fetch_site_data()
+    text, shot_path, schedule_date, dom_events = await fetch_site_data()
     now = datetime.now(TZ)
     today = now.date()
     state = load_state()
@@ -566,9 +520,8 @@ async def check_once():
             "Cloudflare Challenge: графік недоступний для бота."
         )
 
-    img_events = parse_gpv_image_4_1(shot_path, schedule_date)
     text_events = extract_events(text, schedule_date)
-    merged = {(s.isoformat(), e.isoformat()): (s, e) for s, e in (img_events + text_events)}
+    merged = {(s.isoformat(), e.isoformat()): (s, e) for s, e in (dom_events + text_events)}
     all_day_events = sorted(merged.values(), key=lambda x: x[0])
     future_events = [(s, e) for s, e in all_day_events if e > now]
 
@@ -602,9 +555,9 @@ async def check_once():
             )
         else:
             summary_msg = (
-                f"✅ Черга {QUEUE} ({TOWN_NAME}, {STREET_NAME}) — графік на {when_word} ({schedule_date:%d.%m.%Y})\n"
-                f"На {when_word} відключень по черзі {QUEUE} не заплановано.\n"
-                f"Оновлено на сайті: {update_stamp}"
+                f"ℹ️ Черга {QUEUE} ({TOWN_NAME}, {STREET_NAME}) — графік на {when_word} ({schedule_date:%d.%m.%Y})\n"
+                f"Оновлено на сайті: {update_stamp}\n"
+                f"Графік на фото (перевір сітку по черзі {QUEUE} на {when_word})."
             )
         telegram_send(summary_msg)
 
