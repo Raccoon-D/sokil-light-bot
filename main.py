@@ -213,7 +213,7 @@ async def close_accessibility_modal(page):
             )
             if await btn.count() > 0 and await btn.first.is_visible():
                 await btn.first.click(timeout=3000)
-                await page.wait_for_timeout(800)
+                await page.wait_for_timeout(600)
                 return
         except Exception:
             continue
@@ -236,7 +236,7 @@ async def select_today_date(frame, page, target_date):
                 val = ((await opt.get_attribute("value")) or "").strip()
                 if any(v in txt or v in val for v in variants):
                     await sel.select_option(index=j)
-                    await page.wait_for_timeout(800)
+                    await page.wait_for_timeout(600)
                     logging.info("Обрано дату ГПВ у списку: %s", txt or val)
                     return True
         except Exception:
@@ -244,16 +244,17 @@ async def select_today_date(frame, page, target_date):
     return False
 
 
-async def _safe_fill_input(inp, page, value):
+async def _type_like_user(inp, page, value):
     try:
         await inp.scroll_into_view_if_needed(timeout=4000)
     except Exception:
         pass
-    await page.wait_for_timeout(200)
+    await page.wait_for_timeout(150)
     try:
-        await inp.click(timeout=2500)
-        await inp.fill("", timeout=2500)
-        await inp.type(value, delay=50, timeout=4000)
+        await inp.click(timeout=3000)
+        await inp.fill("")
+        await inp.type(value, delay=70, timeout=5000)
+        await page.wait_for_timeout(300)
         return True
     except Exception:
         pass
@@ -317,34 +318,14 @@ async def click_select_button(frame, page):
     return False
 
 
-async def _find_street_input(frame):
-    inputs = frame.locator("input[type='text']:visible, input:not([type]):visible")
-    cnt = await inputs.count()
-    for idx in range(cnt):
-        cand = inputs.nth(idx)
-        try:
-            ph = ((await cand.get_attribute("placeholder")) or "").lower()
-            nm = ((await cand.get_attribute("name")) or "").lower()
-            val = ((await cand.input_value()) or "").strip().lower()
-            if "вулиц" in ph or "street" in ph or "вулиц" in nm or "street" in nm:
-                return cand
-            if idx > 0 and val != TOWN_NAME.lower():
-                return cand
-        except Exception:
-            continue
-    if cnt >= 2:
-        return inputs.nth(cnt - 1)
-    return None
-
-
-async def _wait_for_result_block(page, timeout_ms=10000):
+async def _wait_for_filter_result(page, timeout_ms=10000):
     deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000.0)
     while asyncio.get_running_loop().time() < deadline:
         for frame in page.frames:
             try:
                 txt = (await frame.evaluate("() => document.body ? document.body.innerText : ''")) or ""
                 low = txt.lower()
-                if "фільтр:" in low or ("молодіжна" in low and ("4.1" in low or bool(TIME_RE.search(txt)))):
+                if "фільтр:" in low and ("сокіл" in low or "молодіжна" in low or "не знайдено" in low):
                     return True
             except Exception:
                 continue
@@ -356,55 +337,25 @@ async def fill_address_in_frame(frame, page, target_date):
     await select_today_date(frame, page, target_date)
 
     inputs = frame.locator("input[type='text']:visible, input:not([type]):visible")
-    if await inputs.count() == 0:
+    cnt = await inputs.count()
+    if cnt == 0:
         return False
 
     try:
         town_inp = inputs.nth(0)
-        await _safe_fill_input(town_inp, page, TOWN_NAME)
-        await page.wait_for_timeout(400)
+        await _type_like_user(town_inp, page, TOWN_NAME)
 
-        street_inp = await _find_street_input(frame)
-        if street_inp is not None:
-            await _safe_fill_input(street_inp, page, STREET_NAME)
-            await page.wait_for_timeout(400)
+        if cnt >= 2:
+            street_inp = inputs.nth(1)
+            await _type_like_user(street_inp, page, STREET_NAME)
 
         clicked = await click_select_button(frame, page)
         if clicked:
-            await _wait_for_result_block(page, timeout_ms=10000)
+            await _wait_for_filter_result(page, timeout_ms=10000)
         return clicked
     except Exception as e:
         logging.warning("Помилка заповнення форми: %s", e)
     return False
-
-
-async def _safe_clipped_shot(page, out_path, box):
-    if (
-        isinstance(box, dict)
-        and all(k in box for k in ("x", "y", "width", "height"))
-        and all(
-            isinstance(box[k], (int, float))
-            and box[k] == box[k]
-            and abs(box[k]) != float("inf")
-            for k in ("x", "y", "width", "height")
-        )
-        and box["width"] >= 150
-        and box["height"] >= 150
-    ):
-        x = max(0.0, float(box["x"]))
-        y = max(0.0, float(box["y"]))
-        w = max(150.0, min(1366.0 - x, float(box["width"])))
-        h = max(150.0, min(2200.0, float(box["height"])))
-        try:
-            await page.evaluate("(posY) => window.scrollTo(0, posY)", max(0.0, y - 40.0))
-            await page.wait_for_timeout(300)
-            await page.screenshot(path=str(out_path), clip={"x": x, "y": y, "width": w, "height": h})
-            if out_path.exists() and out_path.stat().st_size > 4000:
-                return
-        except Exception:
-            pass
-
-    await page.screenshot(path=str(out_path), full_page=False)
 
 
 async def capture_two_screenshots(page):
@@ -414,50 +365,53 @@ async def capture_two_screenshots(page):
                 .forEach(sel => document.querySelectorAll(sel).forEach(el => { el.style.display = 'none'; }));
         }"""
     )
-    await page.set_viewport_size({"width": 1366, "height": 2200})
 
     # 1-й скріншот: сітка графіків ГПВ
-    grid_box = await page.evaluate(
-        """() => {
-            let best = null;
-            for (const el of document.querySelectorAll('section, article, div, table, figure, canvas, img')) {
-                const txt = (el.innerText || '').trim();
-                const r = el.getBoundingClientRect();
-                if (!Number.isFinite(r.x) || !Number.isFinite(r.y) || r.width < 350 || r.height < 180 || r.height > 1800) continue;
-                const hasGridHeader = txt.includes('ГПВ на') || (txt.includes('00:00') && (txt.includes('1.1') || txt.includes('4.1')));
-                if (!hasGridHeader) continue;
-                const area = r.width * r.height;
-                if (!best || area < best.area) {
-                    best = {
-                        area,
-                        x: Math.max(0, r.left + window.scrollX - 10),
-                        y: Math.max(0, r.top + window.scrollY - 15),
-                        width: Math.min(1366, r.width + 20),
-                        height: Math.min(2000, r.height + 25),
-                    };
-                }
-            }
-            return best ? { x: best.x, y: best.y, width: best.width, height: best.height } : null;
-        }"""
-    )
-    await _safe_clipped_shot(page, SHOT_GRIDS_FILE, grid_box)
+    grid_y = None
+    for frame in page.frames:
+        try:
+            pos = await frame.evaluate(
+                """() => {
+                    const els = Array.from(document.querySelectorAll('h1, h2, h3, h4, p, div, section, table'));
+                    const hit = els.find(el => {
+                        const r = el.getBoundingClientRect();
+                        const t = (el.innerText || '').trim();
+                        return r.height > 20 && r.width > 200 && (t.includes('ГПВ на') || (t.includes('00:00') && t.includes('1.1')));
+                    });
+                    if (!hit) return null;
+                    const r = hit.getBoundingClientRect();
+                    let offsetY = 0;
+                    let win = window;
+                    while (win && win !== win.parent) {
+                        const frameEl = win.frameElement;
+                        if (!frameEl) break;
+                        const fr = frameEl.getBoundingClientRect();
+                        offsetY += fr.top + win.parent.scrollY;
+                        win = win.parent;
+                    }
+                    return r.top + window.scrollY + offsetY;
+                }"""
+            )
+            if isinstance(pos, (int, float)) and pos == pos and abs(pos) != float("inf"):
+                grid_y = max(0.0, float(pos) - 40.0)
+                break
+        except Exception:
+            continue
 
-    # 2-й скріншот: блок фільтра/таблиці результатів пошуку адреси
+    await page.evaluate("(y) => window.scrollTo(0, y)", float(grid_y or 0.0))
+    await page.wait_for_timeout(350)
+    await page.screenshot(path=str(SHOT_GRIDS_FILE), full_page=False)
+
+    # 2-й скріншот: блок фільтра та результатів пошуку адреси
     search_y = None
     for frame in page.frames:
         try:
             pos = await frame.evaluate(
                 """() => {
                     const checks = [
-                        el => {
-                            const t = (el.innerText || '').trim();
-                            return t.includes('Фільтр:') && (t.includes('Сокіл') || t.includes('Молодіжна'));
-                        },
-                        el => {
-                            const t = (el.innerText || '').trim();
-                            return t.includes('Район') && t.includes('Черга') && t.includes('Молодіжна');
-                        },
-                        el => (el.innerText || '').trim().includes('Пошук вашої адреси'),
+                        el => (el.innerText || '').includes('Фільтр:'),
+                        el => (el.innerText || '').includes('Пошук вашої адреси'),
+                        el => (el.innerText || '').includes('Вибраної адреси у графіках не знайдено'),
                     ];
                     for (const pred of checks) {
                         const hit = Array.from(document.querySelectorAll('h1, h2, h3, h4, p, div, section, table')).find(el => {
@@ -482,17 +436,13 @@ async def capture_two_screenshots(page):
                 }"""
             )
             if isinstance(pos, (int, float)) and pos == pos and abs(pos) != float("inf"):
-                search_y = max(0.0, float(pos) - 70.0)
+                search_y = max(0.0, float(pos) - 80.0)
                 break
         except Exception:
             continue
 
-    await page.set_viewport_size({"width": 1366, "height": 1150})
-    if search_y is not None:
-        await page.evaluate("(y) => window.scrollTo(0, y)", search_y)
-    else:
-        await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight * 0.55)")
-    await page.wait_for_timeout(400)
+    await page.evaluate("(y) => window.scrollTo(0, y)", float(search_y or 750.0))
+    await page.wait_for_timeout(350)
     await page.screenshot(path=str(SHOT_SEARCH_FILE), full_page=False)
 
     return SHOT_GRIDS_FILE, SHOT_SEARCH_FILE
@@ -517,7 +467,7 @@ async def fetch_site_data():
     browser = AsyncCamoufox(**kwargs)
     ctx = await browser.__aenter__()
     try:
-        page = await ctx.new_page(viewport={"width": 1366, "height": 1400})
+        page = await ctx.new_page(viewport={"width": 1366, "height": 1150})
         try:
             await page.goto(SOURCE_URL, wait_until="domcontentloaded", timeout=60000)
         except Exception as e:
