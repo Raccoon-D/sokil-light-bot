@@ -102,17 +102,35 @@ def parse_date(text):
     return None
 
 
-def extract_events(page_text):
+def extract_schedule_date(page_text, fallback_date):
+    m_gpv = re.search(r"ГПВ\s+на\s+(\d{1,2}[./-]\d{1,2}[./-]\d{4}|\d{4}-\d{1,2}-\d{1,2})", page_text)
+    if m_gpv:
+        parsed = parse_date(m_gpv.group(1))
+        if parsed:
+            return parsed
+
+    lines = [line.strip() for line in page_text.splitlines() if line.strip()]
+    for line in lines[:40]:
+        if "Оновлено:" in line:
+            continue
+        parsed = parse_date(line)
+        if parsed:
+            return parsed
+
+    return fallback_date
+
+
+def extract_events(page_text, default_date):
     lines = [re.sub(r"[ \t]+", " ", line).strip() for line in page_text.splitlines()]
     lines = [line for line in lines if line]
 
     now = datetime.now(TZ)
-    current_date = now.date()
+    current_date = extract_schedule_date(page_text, default_date)
     events = []
 
     for idx, line in enumerate(lines):
         found_date = parse_date(line)
-        if found_date and not TIME_RE.search(line):
+        if found_date and not TIME_RE.search(line) and "Оновлено:" not in line:
             current_date = found_date
 
         parts = [p.strip() for p in re.split(r"\s*\|\s*|\t+", line) if p.strip()]
@@ -141,6 +159,85 @@ def extract_events(page_text):
 
     unique = {}
     for start, end in events:
+        unique[(start.isoformat(), end.isoformat())] = (start, end)
+    return sorted(unique.values(), key=lambda x: x[0])
+
+
+async def extract_grid_events(page, schedule_date):
+    """Пробує зчитати активні клітинки для черги 4 / підчерги 1 (4.1) з HTML-таблиць графіка."""
+    now = datetime.now(TZ)
+    grid_events = []
+
+    for frame in page.frames:
+        try:
+            raw_slots = await frame.evaluate(
+                """() => {
+                    const out = [];
+                    const tables = Array.from(document.querySelectorAll('table'));
+                    for (const tbl of tables) {
+                        const headers = Array.from(tbl.querySelectorAll('thead tr th, tr:first-child th, tr:first-child td'))
+                            .map(el => el.innerText.replace(/\\s+/g, ' ').trim());
+                        const rows = Array.from(tbl.querySelectorAll('tbody tr, tr'));
+                        let activeQueue = '';
+                        for (const tr of rows) {
+                            const cells = Array.from(tr.querySelectorAll('th, td'));
+                            if (!cells.length) continue;
+                            const firstText = cells[0].innerText.replace(/\\s+/g, ' ').trim();
+                            if (/^[1-6]$/.test(firstText)) {
+                                activeQueue = firstText;
+                            }
+                            const secondText = cells.length > 1 ? cells[1].innerText.replace(/\\s+/g, ' ').trim() : '';
+                            const rowLabel = `${activeQueue}.${secondText}`;
+                            if (activeQueue === '4' && (secondText === '1' || rowLabel.includes('4.1'))) {
+                                cells.forEach((cell, idx) => {
+                                    const style = window.getComputedStyle(cell);
+                                    const cls = (cell.className || '').toString().toLowerCase();
+                                    const bg = style.backgroundColor || '';
+                                    const dataAttr = JSON.stringify(cell.dataset || {}).toLowerCase();
+                                    const isOff = (
+                                        cls.includes('off') ||
+                                        cls.includes('out') ||
+                                        cls.includes('disable') ||
+                                        cls.includes('active') ||
+                                        cls.includes('dark') ||
+                                        dataAttr.includes('off') ||
+                                        dataAttr.includes('1') ||
+                                        /rgb\\((\\d+),\\s*(\\d+),\\s*(\\d+)\\)/.test(bg) && (() => {
+                                            const m = bg.match(/rgb\\((\\d+),\\s*(\\d+),\\s*(\\d+)\\)/);
+                                            const r = Number(m[1]), g = Number(m[2]), b = Number(m[3]);
+                                            return (r + g + b) < 420 && Math.max(r, g, b) - Math.min(r, g, b) < 45;
+                                        })()
+                                    );
+                                    if (isOff && idx >= 2) {
+                                        out.push({
+                                            idx,
+                                            header: headers[idx] || '',
+                                            text: cell.innerText.trim(),
+                                        });
+                                    }
+                                });
+                            }
+                        }
+                    }
+                    return out;
+                }"""
+            )
+            for item in raw_slots or []:
+                hdr = item.get("header", "")
+                m = TIME_RE.search(hdr)
+                if m:
+                    sh, sm, eh, em = map(int, m.groups())
+                    start = datetime.combine(schedule_date, time(sh, sm), TZ)
+                    end = datetime.combine(schedule_date, time(eh, em), TZ)
+                    if end <= start:
+                        end += timedelta(days=1)
+                    if end > now:
+                        grid_events.append((start, end))
+        except Exception:
+            continue
+
+    unique = {}
+    for start, end in grid_events:
         unique[(start.isoformat(), end.isoformat())] = (start, end)
     return sorted(unique.values(), key=lambda x: x[0])
 
@@ -203,32 +300,65 @@ async def fill_address_in_frame(frame, page):
 
 
 async def capture_schedule_screenshot(page):
-    # Пробуємо сфокусуватись на блоці графіка/таблиці, щоб скріншот був ближчим до самого графіка
-    target_selectors = [
-        "table",
-        "[class*='schedule' i]",
-        "[class*='graph' i]",
-        "[class*='gpv' i]",
-        "main",
-    ]
-    for sel in target_selectors:
-        try:
-            loc = page.locator(sel)
-            if await loc.count() > 0:
-                box = await loc.first.bounding_box()
-                if box and box["width"] > 300 and box["height"] > 200:
-                    await loc.first.scroll_into_view_if_needed(timeout=3000)
-                    await page.wait_for_timeout(500)
-                    clip = {
-                        "x": max(0, box["x"] - 20),
-                        "y": max(0, box["y"] - 60),
-                        "width": min(1366 - max(0, box["x"] - 20), box["width"] + 40),
-                        "height": min(1400, box["height"] + 120),
+    """Робить акуратний кадр саме сітки ГПВ (як на прикладі 5141.jpg) без шапки й модалок."""
+    await page.evaluate(
+        """() => {
+            const hideSelectors = [
+                'header', 'nav', '.navbar', '.header', '.modal', '.accessibility-modal',
+                '[class*="cookie" i]', '[id*="cookie" i]'
+            ];
+            for (const sel of hideSelectors) {
+                document.querySelectorAll(sel).forEach(el => {
+                    if (!el.innerText || !el.innerText.includes('00:00')) {
+                        el.style.display = 'none';
                     }
-                    await page.screenshot(path=str(SCREENSHOT_FILE), clip=clip)
-                    return
-        except Exception:
-            continue
+                });
+            }
+        }"""
+    )
+
+    # Шукаємо елемент, що містить сітку годин / ГПВ
+    target_box = await page.evaluate(
+        """() => {
+            const candidates = Array.from(document.querySelectorAll('section, article, div, table'));
+            let best = null;
+            let bestArea = Infinity;
+            for (const el of candidates) {
+                const txt = (el.innerText || '');
+                if (!txt.includes('00:00') || !txt.includes('12:00')) continue;
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 450 || rect.height < 250 || rect.height > 2600) continue;
+                const area = rect.width * rect.height;
+                if (area < bestArea) {
+                    bestArea = area;
+                    best = {
+                        x: rect.x + window.scrollX,
+                        y: rect.y + window.scrollY,
+                        width: rect.width,
+                        height: rect.height,
+                    };
+                }
+            }
+            return best;
+        }"""
+    )
+
+    if target_box:
+        await page.set_viewport_size({"width": 1366, "height": min(2400, max(900, int(target_box["height"] + 120)))})
+        await page.evaluate(
+            """(y) => window.scrollTo(0, Math.max(0, y - 40))""",
+            target_box["y"],
+        )
+        await page.wait_for_timeout(400)
+
+        clip = {
+            "x": max(0, target_box["x"] - 10),
+            "y": max(0, target_box["y"] - 20),
+            "width": min(1366, target_box["width"] + 20),
+            "height": min(2200, target_box["height"] + 40),
+        }
+        await page.screenshot(path=str(SCREENSHOT_FILE), clip=clip)
+        return
 
     await page.screenshot(path=str(SCREENSHOT_FILE), full_page=False)
 
@@ -323,12 +453,24 @@ async def fetch_site_data():
             except Exception:
                 continue
 
+        full_text = "\n---\n".join(texts)
+        schedule_date = extract_schedule_date(full_text, datetime.now(TZ).date())
+        grid_events = await extract_grid_events(page, schedule_date)
+
         try:
             await capture_schedule_screenshot(page)
         except Exception as e:
             logging.error("Не вдалося зробити скріншот: %s", e)
 
-    return "\n---\n".join(texts), SCREENSHOT_FILE
+    return full_text, SCREENSHOT_FILE, schedule_date, grid_events
+
+
+def day_label(target_date, today):
+    if target_date == today:
+        return "сьогодні"
+    if target_date == today + timedelta(days=1):
+        return "завтра"
+    return target_date.strftime("%d.%m.%Y")
 
 
 def telegram_send(message):
@@ -379,8 +521,9 @@ def extract_update_stamp(page_text):
 
 async def check_once():
     logging.info("Перевіряю офіційний графік для черги %s", QUEUE)
-    text, shot_path = await fetch_site_data()
+    text, shot_path, schedule_date, grid_events = await fetch_site_data()
     now = datetime.now(TZ)
+    today = now.date()
     state = load_state()
     changed = False
 
@@ -398,15 +541,18 @@ async def check_once():
             "Cloudflare Challenge: графік недоступний для бота."
         )
 
-    events = extract_events(text)
-    has_4_1_text = ("4.1" in text) or bool(events)
+    text_events = extract_events(text, schedule_date)
+    merged = {(s.isoformat(), e.isoformat()): (s, e) for s, e in (grid_events + text_events)}
+    events = sorted(merged.values(), key=lambda x: x[0])
+
+    when_word = day_label(schedule_date, today)
     update_stamp = extract_update_stamp(text)
 
     if shot_path.exists():
         shot_hash = hashlib.md5(shot_path.read_bytes()).hexdigest()
         caption = (
-            f"Графік ({QUEUE}) | {TOWN_NAME}, {STREET_NAME}\n"
-            f"Перевірено: {now:%Y-%m-%d %H:%M} | Оновлено на сайті: {update_stamp}"
+            f"Графік ({QUEUE}) на {schedule_date:%d.%m.%Y} ({when_word})\n"
+            f"Оновлено на сайті: {update_stamp}"
         )
         try:
             telegram_send_photo(shot_path, caption)
@@ -419,19 +565,19 @@ async def check_once():
     if SEND_TEXT_SUMMARY:
         if events:
             lines_txt = "\n".join(
-                f"• {s:%Y-%m-%d} | {s:%H:%M}–{e:%H:%M}" for s, e in events
+                f"• {day_label(s.date(), today)} ({s:%d.%m}): {s:%H:%M}–{e:%H:%M}"
+                for s, e in events
             )
             summary_msg = (
-                f"📋 Звіт по черзі {QUEUE} ({TOWN_NAME}, {STREET_NAME})\n"
-                f"Оновлено на сайті: {update_stamp}\n"
-                f"Знайдено інтервалів:\n{lines_txt}"
+                f"⚡️ Черга {QUEUE} ({TOWN_NAME}, {STREET_NAME}) — графік на {when_word} ({schedule_date:%d.%m.%Y})\n"
+                f"Відключення заплановані ({when_word}):\n{lines_txt}\n"
+                f"Оновлено на сайті: {update_stamp}"
             )
         else:
             summary_msg = (
-                f"📋 Звіт по черзі {QUEUE} ({TOWN_NAME}, {STREET_NAME})\n"
-                f"Оновлено на сайті: {update_stamp}\n"
-                f"Згадка 4.1 у тексті: {'так' if has_4_1_text else 'ні (графік може бути на сітці/картинці)'}\n"
-                "Майбутніх текстових інтервалів не знайдено."
+                f"ℹ️ Черга {QUEUE} ({TOWN_NAME}, {STREET_NAME}) — графік на {when_word} ({schedule_date:%d.%m.%Y})\n"
+                f"Майбутніх відключень для {QUEUE} на {when_word} у даних не виявлено (перевір також сітку на фото).\n"
+                f"Оновлено на сайті: {update_stamp}"
             )
         telegram_send(summary_msg)
 
@@ -443,7 +589,7 @@ async def check_once():
             msg = (
                 "⚡️ Виявлено майбутнє відключення світла\n\n"
                 f"Черга: {QUEUE}\n"
-                f"Дата: {start:%Y-%m-%d}\n"
+                f"Коли: {day_label(start.date(), today)} ({start:%Y-%m-%d})\n"
                 f"Інтервал: {start:%H:%M}–{end:%H:%M}\n\n"
                 "Джерело: Волиньобленерго\n"
                 "Фактичний час може відрізнятися від графіка."
