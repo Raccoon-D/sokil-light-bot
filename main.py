@@ -615,6 +615,26 @@ async def check_once():
         logging.warning("Cloudflare Challenge — пропускаю без відправки в Telegram.")
         return
 
+    events = extract_events(text, schedule_date)
+    houses = extract_houses(text)
+    logging.info("events_count=%s | houses_count=%s", len(events), len(houses))
+
+    if not events:
+        logging.info("Відключень для %s, %s (черга %s) не знайдено — нічого не надсилаю.", TOWN_NAME, STREET_NAME, QUEUE)
+        return
+
+    intervals_sig = ",".join(f"{s:%H:%M}-{e:%H:%M}" for s, e in events)
+    houses_sig = ",".join(houses)
+    signature = f"{schedule_date.isoformat()}|{QUEUE}|{intervals_sig}|{houses_sig}"
+
+    state = load_state()
+    if state.get("last_signature") == signature:
+        logging.info("Змін у графіку немає — повідомлення не надсилаю.")
+        return
+
+    msg = format_styled_message(schedule_date, events, houses)
+    telegram_send(msg)
+
     if grids_shot.exists():
         try:
             telegram_send_photo(
@@ -624,18 +644,7 @@ async def check_once():
         except Exception as e:
             logging.error("Помилка відправки 1-го скріншота: %s", e)
 
-    events = extract_events(text, schedule_date)
-    houses = extract_houses(text)
-    logging.info("events_count=%s | houses_count=%s", len(events), len(houses))
-
-    if not events:
-        logging.info("Відключень для %s, %s (черга %s) не знайдено — текстове сповіщення не надсилаю.", TOWN_NAME, STREET_NAME, QUEUE)
-        return
-
-    msg = format_styled_message(schedule_date, events, houses)
-    telegram_send(msg)
-    state = load_state()
-    state["last_signature"] = f"{schedule_date.isoformat()}|{QUEUE}|{','.join(f'{s:%H:%M}-{e:%H:%M}' for s, e in events)}"
+    state["last_signature"] = signature
     save_state(state)
 
 
