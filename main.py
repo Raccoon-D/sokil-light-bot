@@ -149,22 +149,25 @@ def extract_houses(page_text):
         if not line:
             continue
         low = line.lower()
-        if "молодіжна" in low and "4.1" in line:
-            segment = ""
+        if "молодіжна" in low or ("сокіл" in low and QUEUE_RE.search(line)):
+            segment = line
             if "|" in line:
                 parts = [p.strip() for p in line.split("|")]
                 for idx, part in enumerate(parts):
                     if "молодіжна" in part.lower() and idx + 1 < len(parts):
                         segment = parts[idx + 1]
                         break
-            if not segment:
-                m = re.search(r"Молодіжна\s+(.+?)\s+4\.1\b", line, flags=re.IGNORECASE)
+            else:
+                m = re.search(r"Молодіжна\s+(.+?)(?:\s+4\.1\b|$)", line, flags=re.IGNORECASE)
                 if m:
                     segment = m.group(1)
 
             for part in re.split(r"[,;]+", segment):
                 cleaned = re.sub(r"[<>]", "", part).strip()
-                if not cleaned or cleaned == "4.1" or not re.search(r"\d", cleaned):
+                cleaned = re.sub(r"\b4\.1\b", "", cleaned).strip()
+                if not cleaned or not re.search(r"\d", cleaned):
+                    continue
+                if TIME_RE.search(cleaned) or DATE_YMD_RE.search(cleaned) or DATE_DMY_RE.search(cleaned):
                     continue
                 if cleaned not in seen:
                     seen.add(cleaned)
@@ -185,13 +188,12 @@ def extract_events(page_text, default_date):
             current_date = found_date
 
         low = line.lower()
-        is_target = ("4.1" in line or QUEUE_RE.search(line)) and (
-            "сокіл" in low or "молодіжна" in low or TIME_RE.search(line)
-        )
-        if not is_target:
+        neighbor = " | ".join(lines[max(0, idx - 1) : min(len(lines), idx + 2)])
+        has_queue = bool(QUEUE_RE.search(line) or QUEUE_RE.search(neighbor))
+        has_addr = ("сокіл" in low or "молодіжна" in low or "фільтр:" in low)
+        if not (has_queue and (has_addr or TIME_RE.search(line) or TIME_RE.search(neighbor))):
             continue
 
-        neighbor = " | ".join(lines[max(0, idx - 1) : min(len(lines), idx + 2)])
         row_date = parse_date(line) or parse_date(neighbor) or current_date
         for m in TIME_RE.finditer(line + " " + neighbor):
             sh, sm, eh, em = map(int, m.groups())
@@ -613,22 +615,6 @@ async def check_once():
         logging.warning("Cloudflare Challenge — пропускаю без відправки в Telegram.")
         return
 
-    events = extract_events(text, schedule_date)
-    if not events:
-        logging.info("Відключень для %s, %s (черга %s) не знайдено — у Telegram нічого не надсилаю.", TOWN_NAME, STREET_NAME, QUEUE)
-        return
-
-    houses = extract_houses(text)
-    signature = f"{schedule_date.isoformat()}|{QUEUE}|{','.join(f'{s:%H:%M}-{e:%H:%M}' for s, e in events)}"
-
-    state = load_state()
-    if state.get("last_signature") == signature:
-        logging.info("Цей графік уже надісланий — повторно не пишу.")
-        return
-
-    msg = format_styled_message(schedule_date, events, houses)
-    telegram_send(msg)
-
     if grids_shot.exists():
         try:
             telegram_send_photo(
@@ -638,7 +624,18 @@ async def check_once():
         except Exception as e:
             logging.error("Помилка відправки 1-го скріншота: %s", e)
 
-    state["last_signature"] = signature
+    events = extract_events(text, schedule_date)
+    houses = extract_houses(text)
+    logging.info("events_count=%s | houses_count=%s", len(events), len(houses))
+
+    if not events:
+        logging.info("Відключень для %s, %s (черга %s) не знайдено — текстове сповіщення не надсилаю.", TOWN_NAME, STREET_NAME, QUEUE)
+        return
+
+    msg = format_styled_message(schedule_date, events, houses)
+    telegram_send(msg)
+    state = load_state()
+    state["last_signature"] = f"{schedule_date.isoformat()}|{QUEUE}|{','.join(f'{s:%H:%M}-{e:%H:%M}' for s, e in events)}"
     save_state(state)
 
 
