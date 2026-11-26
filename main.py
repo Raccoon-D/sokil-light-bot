@@ -23,6 +23,7 @@ STREET_NAME = "Молодіжна"
 TZ = ZoneInfo("Europe/Kyiv")
 
 STATE_FILE = Path("state.json")
+SHOT_GRIDS_FILE = Path("schedule_grids.png")
 
 PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -41,6 +42,21 @@ TIME_RE = re.compile(
 DATE_DMY_RE = re.compile(r"(?<!\d)(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?!\d)")
 DATE_YMD_RE = re.compile(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)")
 QUEUE_RE = re.compile(r"(?<![\d.])4\.1(?!\d)")
+
+MONTHS_UK_GENITIVE = {
+    1: "січня",
+    2: "лютого",
+    3: "березня",
+    4: "квітня",
+    5: "травня",
+    6: "червня",
+    7: "липня",
+    8: "серпня",
+    9: "вересня",
+    10: "жовтня",
+    11: "листопада",
+    12: "грудня",
+}
 
 
 def build_camoufox_proxy(proxy_url):
@@ -66,12 +82,11 @@ def load_state():
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         if isinstance(data, dict):
-            data.setdefault("notified", [])
             data.setdefault("last_signature", "")
             return data
     except (FileNotFoundError, json.JSONDecodeError):
         pass
-    return {"notified": [], "last_signature": ""}
+    return {"last_signature": ""}
 
 
 def save_state(state):
@@ -119,24 +134,43 @@ def extract_schedule_date(page_text, fallback_date):
     return fallback_date
 
 
+def _house_sort_key(item):
+    m = re.match(r"^(\d+)([а-яіїєґa-z]*)$", item.strip(), flags=re.IGNORECASE)
+    if m:
+        return (int(m.group(1)), m.group(2).lower())
+    return (999999, item.lower())
+
+
 def extract_houses(page_text):
-    houses = []
+    tokens = []
     seen = set()
     for raw_line in page_text.splitlines():
         line = re.sub(r"\s*\|\s*", " | ", re.sub(r"[ \t]+", " ", raw_line)).strip()
         if not line:
             continue
         low = line.lower()
-        if ("сокіл" in low or "молодіжна" in low) and ("4.1" in line or TIME_RE.search(line)):
+        if "молодіжна" in low and "4.1" in line:
+            segment = ""
             if "|" in line:
                 parts = [p.strip() for p in line.split("|")]
                 for idx, part in enumerate(parts):
                     if "молодіжна" in part.lower() and idx + 1 < len(parts):
-                        candidate = parts[idx + 1].strip()
-                        if candidate and candidate != "4.1" and candidate not in seen:
-                            seen.add(candidate)
-                            houses.append(candidate)
-    return houses
+                        segment = parts[idx + 1]
+                        break
+            if not segment:
+                m = re.search(r"Молодіжна\s+(.+?)\s+4\.1\b", line, flags=re.IGNORECASE)
+                if m:
+                    segment = m.group(1)
+
+            for part in re.split(r"[,;]+", segment):
+                cleaned = re.sub(r"[<>]", "", part).strip()
+                if not cleaned or cleaned == "4.1" or not re.search(r"\d", cleaned):
+                    continue
+                if cleaned not in seen:
+                    seen.add(cleaned)
+                    tokens.append(cleaned)
+
+    return sorted(tokens, key=_house_sort_key)
 
 
 def extract_events(page_text, default_date):
@@ -171,12 +205,9 @@ def extract_events(page_text, default_date):
     return sorted(unique.values(), key=lambda x: x[0])
 
 
-def day_label(target_date, today):
-    if target_date == today:
-        return "сьогодні"
-    if target_date == today + timedelta(days=1):
-        return "завтра"
-    return target_date.strftime("%d.%m.%Y")
+def format_uk_date(d):
+    month_name = MONTHS_UK_GENITIVE.get(d.month, d.strftime("%m"))
+    return f"{d.day} {month_name} {d.year}"
 
 
 def telegram_send(message):
@@ -188,6 +219,22 @@ def telegram_send(message):
         timeout=20,
     )
     logging.info("sendMessage status=%s body=%s", r.status_code, r.text[:300])
+    r.raise_for_status()
+    payload = r.json()
+    if not payload.get("ok"):
+        raise RuntimeError(f"Telegram API error: {payload}")
+
+
+def telegram_send_photo(photo_path, caption=""):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    with open(photo_path, "rb") as f:
+        r = requests.post(
+            url,
+            data={"chat_id": CHAT_ID, "caption": caption[:1000]},
+            files={"photo": f},
+            timeout=30,
+        )
+    logging.info("sendPhoto (%s) status=%s body=%s", photo_path.name, r.status_code, r.text[:300])
     r.raise_for_status()
     payload = r.json()
     if not payload.get("ok"):
@@ -370,6 +417,72 @@ async def fill_address_in_frame(frame, page, target_date):
     return False
 
 
+async def _safe_clipped_shot(page, out_path, box):
+    if (
+        isinstance(box, dict)
+        and all(k in box for k in ("x", "y", "width", "height"))
+        and all(
+            isinstance(box[k], (int, float))
+            and box[k] == box[k]
+            and abs(box[k]) != float("inf")
+            for k in ("x", "y", "width", "height")
+        )
+        and box["width"] >= 150
+        and box["height"] >= 150
+    ):
+        x = max(0.0, float(box["x"]))
+        y = max(0.0, float(box["y"]))
+        w = max(150.0, min(1366.0 - x, float(box["width"])))
+        h = max(150.0, min(2200.0, float(box["height"])))
+        try:
+            await page.evaluate("(posY) => window.scrollTo(0, posY)", max(0.0, y - 40.0))
+            await page.wait_for_timeout(300)
+            await page.screenshot(path=str(out_path), clip={"x": x, "y": y, "width": w, "height": h})
+            if out_path.exists() and out_path.stat().st_size > 4000:
+                return
+        except Exception:
+            pass
+
+    await page.screenshot(path=str(out_path), full_page=False)
+
+
+async def capture_first_screenshot(page):
+    await page.evaluate(
+        """() => {
+            ['header', 'nav', '.navbar', '.header', 'footer', '.footer', '.modal', '.accessibility-modal', '[class*="cookie" i]', '[id*="cookie" i]']
+                .forEach(sel => document.querySelectorAll(sel).forEach(el => { el.style.display = 'none'; }));
+        }"""
+    )
+    await page.set_viewport_size({"width": 1366, "height": 2200})
+    grid_box = await page.evaluate(
+        """() => {
+            let minY = Infinity, maxBottom = -Infinity, minX = Infinity, maxRight = -Infinity;
+            for (const el of document.querySelectorAll('h1, h2, h3, h4, div, p, section, table, img, canvas')) {
+                const txt = el.innerText || '';
+                const r = el.getBoundingClientRect();
+                if (!Number.isFinite(r.x) || !Number.isFinite(r.y) || r.width < 100 || r.height < 20) continue;
+                const isGrid = txt.includes('ГПВ на') || (r.width >= 450 && r.height >= 200);
+                if (!isGrid) continue;
+                minY = Math.min(minY, r.top + window.scrollY);
+                maxBottom = Math.max(maxBottom, r.bottom + window.scrollY);
+                minX = Math.min(minX, r.left + window.scrollX);
+                maxRight = Math.max(maxRight, r.right + window.scrollX);
+            }
+            if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxRight) || !Number.isFinite(maxBottom) || maxBottom <= minY) {
+                return null;
+            }
+            return {
+                x: Math.max(0, minX - 15),
+                y: Math.max(0, minY - 25),
+                width: Math.max(600, (maxRight - minX) + 30),
+                height: Math.max(450, (maxBottom - minY) + 40),
+            };
+        }"""
+    )
+    await _safe_clipped_shot(page, SHOT_GRIDS_FILE, grid_box)
+    return SHOT_GRIDS_FILE
+
+
 async def fetch_site_data():
     texts = []
     today = datetime.now(TZ).date()
@@ -439,33 +552,60 @@ async def fetch_site_data():
 
         full_text = "\n---\n".join(texts)
         schedule_date = extract_schedule_date(full_text, today)
+        try:
+            grids_shot = await capture_first_screenshot(page)
+        except Exception as e:
+            logging.error("Не вдалося зробити 1-й скріншот: %s", e)
+            grids_shot = SHOT_GRIDS_FILE
     finally:
         try:
             await browser.__aexit__(None, None, None)
         except Exception:
             pass
 
-    return full_text, schedule_date
+    return full_text, grids_shot, schedule_date
 
 
-def format_clean_message(schedule_date, today, events, houses):
-    when_word = day_label(schedule_date, today)
-    intervals_text = "\n".join(f"• {s:%H:%M} – {e:%H:%M}" for s, e in events)
-    houses_line = f"\nБудинки: {', '.join(houses[:4])}" if houses else ""
+def _format_house_token(h):
+    if h == "8":
+        return "❗ 8 ❗"
+    return h
+
+
+def format_styled_message(schedule_date, events, houses):
+    times_block = "\n".join(f"🕗 {s:%H:%M} — {e:%H:%M}" for s, e in events)
+    formatted_houses = [_format_house_token(h) for h in houses]
+    house_rows = []
+    for idx in range(0, len(formatted_houses), 7):
+        chunk = formatted_houses[idx : idx + 7]
+        house_rows.append("│ " + " · ".join(chunk))
+    houses_block = "\n".join(house_rows) if house_rows else "│ —"
+    date_str = format_uk_date(schedule_date)
+
     return (
-        f"⚡ Графік відключень світла\n"
-        f"Коли: {when_word} ({schedule_date:%d.%m.%Y})\n"
-        f"Адреса: {TOWN_NAME}, вул. {STREET_NAME}\n"
-        f"Черга: {QUEUE}{houses_line}\n\n"
-        f"Час відключень:\n{intervals_text}"
+        f'⚡ {TOWN_NAME.upper()} LIGHT\n'
+        f'"ЕНЕРГОСПОВІЩЕННЯ"\n\n'
+        f'╭───────────────\n'
+        f'│ 📍 {TOWN_NAME.upper()}\n'
+        f'│ {STREET_NAME} · Черга {QUEUE}\n'
+        f'╰───────────────\n\n'
+        f'🔴 ВІДКЛЮЧЕННЯ\n\n'
+        f'{times_block}\n\n'
+        f'╭───────────────\n'
+        f'│ 🏠 БУДИНКИ\n'
+        f'│\n'
+        f'{houses_block}\n'
+        f'╰───────────────\n\n'
+        f'📆 {date_str}\n'
+        f'━━━━━━━━━━━━━━━━\n'
+        f'💡 {TOWN_NAME.upper()} LIGHT BOT\n'
+        f'Світло. Час. Інформація.'
     )
 
 
 async def check_once():
     logging.info("Перевіряю графік для %s, %s (черга %s)", TOWN_NAME, STREET_NAME, QUEUE)
-    text, schedule_date = await fetch_site_data()
-    now = datetime.now(TZ)
-    today = now.date()
+    text, grids_shot, schedule_date = await fetch_site_data()
 
     if not text.strip() or any(
         k in text for k in ["Триває перевірка безпеки", "Трохи зачекайте", "Cloudflare", "Ray ID:", "Verify you are human"]
@@ -475,7 +615,7 @@ async def check_once():
 
     events = extract_events(text, schedule_date)
     if not events:
-        logging.info("Графіка/інтервалів відключення для адреси/черги не знайдено — в Telegram нічого не пишу.")
+        logging.info("Відключень для %s, %s (черга %s) не знайдено — у Telegram нічого не надсилаю.", TOWN_NAME, STREET_NAME, QUEUE)
         return
 
     houses = extract_houses(text)
@@ -486,8 +626,18 @@ async def check_once():
         logging.info("Цей графік уже надісланий — повторно не пишу.")
         return
 
-    msg = format_clean_message(schedule_date, today, events, houses)
+    msg = format_styled_message(schedule_date, events, houses)
     telegram_send(msg)
+
+    if grids_shot.exists():
+        try:
+            telegram_send_photo(
+                grids_shot,
+                f"Графік ГПВ | {format_uk_date(schedule_date)}",
+            )
+        except Exception as e:
+            logging.error("Помилка відправки 1-го скріншота: %s", e)
+
     state["last_signature"] = signature
     save_state(state)
 
